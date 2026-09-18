@@ -1,0 +1,19 @@
+name = "hh-notifier"
+main = "index.js"
+compatibility_date = "2026-09-01"
+
+# cron по UTC: 4,6,8,...,18 часов = 07:00–21:00 МСК, каждые 2 часа
+[triggers]
+crons = ["0 4,6,8,10,12,14,16,18 * * *"]
+
+# KV для дедупликации; id после создания namespace:
+#   wrangler kv namespace create STATE  ->  вставьте id ниже
+# (при деплое через dashboard binding создаётся в UI, этот блок не нужен)
+[[kv_namespaces]]
+binding = "STATE"
+id = "ЗАМЕНИТЕ_НА_ID_KV"
+
+[vars]
+TELEGRAM_CHAT_ID = "983824287"
+# токен бота сюда НЕ вписываем: wrangler secret put TELEGRAM_BOT_TOKEN
+# (или в dashboard: Settings -> Variables -> Secret)
