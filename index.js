@@ -232,28 +232,15 @@ async function runNotifier(env) {
   return { fresh: fresh.length, sent: fresh.length };
 }
 
-function esc(s) {
-  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-
 const fmtMSK = new Intl.DateTimeFormat('ru-RU', {
   timeZone: 'Europe/Moscow', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit',
 });
 
-function vacancyBlock(v) {
-  const parts = [v.company, v.region, v.salary].filter(Boolean).join(' · ');
-  return (
-    `<a href="${esc(v.link)}"><b>${esc(v.title)}</b></a>\n` +
-    (parts ? esc(parts) + '\n' : '') +
-    `<i>опубликовано ${fmtMSK.format(v.pub)} · поиск: ${esc(v.search)}</i>`
-  );
-}
-
-// каждое сообщение — одна вакансия; первым идёт заголовок с общим числом
+// каждое сообщение — чистая ссылка на вакансию; первым идёт заголовок с общим числом
 function formatMessages(fresh) {
   const header = `hh.ru: новых вакансий — ${fresh.length} (${fmtMSK.format(Date.now())})`;
   const sorted = fresh.sort((a, b) => a.search.localeCompare(b.search));
-  return [header, ...sorted.map(vacancyBlock)];
+  return [header, ...sorted.map((v) => v.link)];
 }
 
 async function sendTelegram(env, texts) {
