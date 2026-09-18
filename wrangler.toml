@@ -11,7 +11,7 @@ crons = ["0 4,6,8,10,12,14,16,18 * * *"]
 # (при деплое через dashboard binding создаётся в UI, этот блок не нужен)
 [[kv_namespaces]]
 binding = "STATE"
-id = "ЗАМЕНИТЕ_НА_ID_KV"
+id = "76401932f33845cebbd05fa530681e6b"
 
 [vars]
 TELEGRAM_CHAT_ID = "983824287"
