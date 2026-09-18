@@ -248,27 +248,21 @@ function vacancyBlock(v) {
   );
 }
 
-// формирует тексты сообщений (лимит Telegram — 4096 символов, держим запас)
+// каждое сообщение — одна вакансия; первым идёт заголовок с общим числом
 function formatMessages(fresh) {
   const header = `hh.ru: новых вакансий — ${fresh.length} (${fmtMSK.format(Date.now())})`;
-  const blocks = fresh.sort((a, b) => a.search.localeCompare(b.search)).map(vacancyBlock);
-  const chunks = [];
-  let cur = header + '\n\n';
-  for (const b of blocks) {
-    if (cur.length + b.length + 2 > 3800) { chunks.push(cur.trim()); cur = ''; }
-    cur += b + '\n\n';
-  }
-  if (cur.trim()) chunks.push(cur.trim());
-  return chunks;
+  const sorted = fresh.sort((a, b) => a.search.localeCompare(b.search));
+  return [header, ...sorted.map(vacancyBlock)];
 }
 
 async function sendTelegram(env, texts) {
   const chatId = Number(env.TELEGRAM_CHAT_ID);
-  for (const text of texts) {
+  for (let i = 0; i < texts.length; i++) {
+    if (i > 0) await sleep(400); // лимит Telegram ~1 сообщение/сек на чат
     const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML', disable_web_page_preview: true }),
+      body: JSON.stringify({ chat_id: chatId, text: texts[i], parse_mode: 'HTML', disable_web_page_preview: true }),
     });
     const data = await res.json();
     if (!data.ok) throw new Error('Telegram API: ' + (data.description || res.status));
