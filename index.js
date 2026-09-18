@@ -10,13 +10,18 @@ export default {
     ctx.waitUntil(runNotifier(env).catch((e) => console.error('FATAL: ' + e.message)));
   },
   // ручной прогон: https://<имя-воркера>.<поддомен>.workers.dev/run
+  // тест канала доставки: /test — шлёт сообщение в Telegram независимо от вакансий
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname === '/run') {
       await runNotifier(env);
       return new Response('OK: прогон выполнен (лог — dashboard Logs или wrangler tail)');
     }
-    return new Response('hh-notifier worker. GET /run — ручной прогон.');
+    if (url.pathname === '/test') {
+      await sendTelegram(env, ['✅ Тест доставки: hh-notifier работает из Cloudflare Workers. Новые вакансии будут приходить сюда.']);
+      return new Response('OK: тестовое сообщение отправлено в Telegram');
+    }
+    return new Response('hh-notifier worker. GET /run — прогон, GET /test — проверка Telegram.');
   },
 };
 
