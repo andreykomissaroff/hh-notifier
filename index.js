@@ -9,10 +9,10 @@ export default {
   async scheduled(controller, env, ctx) {
     ctx.waitUntil(runNotifier(env).catch((e) => console.error('FATAL: ' + e.message)));
   },
-  // ручной прогон: https://<имя-воркера>.<поддомен>.workers.dev/run
-  // тест канала доставки: /test — шлёт сообщение в Telegram независимо от вакансий
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
+
+    // ручной прогон: /run; тест канала: /test
     if (url.pathname === '/run') {
       await runNotifier(env);
       return new Response('OK: прогон выполнен (лог — dashboard Logs или wrangler tail)');
@@ -21,9 +21,64 @@ export default {
       await sendTelegram(env, ['✅ Тест доставки: hh-notifier работает из Cloudflare Workers. Новые вакансии будут приходить сюда.']);
       return new Response('OK: тестовое сообщение отправлено в Telegram');
     }
+
+    // Telegram webhook: команды прямо из чата с ботом (/run, /test, /help)
+    if (env.TELEGRAM_WEBHOOK_SECRET && url.pathname === '/tg/' + env.TELEGRAM_WEBHOOK_SECRET) {
+      let update;
+      try { update = await request.json(); } catch { return new Response('bad json', { status: 400 }); }
+      const msg = update.message;
+      // команды принимает только ваш чат
+      if (msg && msg.text && String(msg.chat.id) === String(env.TELEGRAM_CHAT_ID)) {
+        const cmd = msg.text.trim().toLowerCase().split('@')[0];
+        if (cmd === '/run') {
+          ctx.waitUntil(handleRunCommand(env, msg.chat.id));
+        } else if (cmd === '/test') {
+          ctx.waitUntil(sendTelegramTo(env, msg.chat.id, ['✅ Тест доставки: связь воркер → Telegram работает.']).catch(() => {}));
+        } else if (cmd === '/help' || cmd === '/start') {
+          ctx.waitUntil(sendTelegramTo(env, msg.chat.id, [
+            'Команды hh-notifier:',
+            '/run — проверить hh.ru прямо сейчас (пришлю вакансии, если появились новые)',
+            '/test — проверить доставку сообщений',
+            '/help — эта справка',
+          ].join('\n')).catch(() => {}));
+        } else {
+          ctx.waitUntil(sendTelegramTo(env, msg.chat.id, ['Не знаю такую команду. Доступно: /run, /test, /help']).catch(() => {}));
+        }
+      }
+      // Telegram ждёт быстрый 200; работа продолжается в фоне
+      return new Response('OK');
+    }
+
+    // подключение webhook (защищено тем же секретом): /setup?key=СЕКРЕТ
+    if (url.pathname === '/setup' && env.TELEGRAM_WEBHOOK_SECRET && url.searchParams.get('key') === env.TELEGRAM_WEBHOOK_SECRET) {
+      const hookUrl = url.origin + '/tg/' + env.TELEGRAM_WEBHOOK_SECRET;
+      const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: hookUrl, allowed_updates: ['message'], drop_pending_updates: true }),
+      });
+      const data = await res.json();
+      return new Response(JSON.stringify(data), { status: data.ok ? 200 : 500, headers: { 'Content-Type': 'application/json' } });
+    }
+
     return new Response('hh-notifier worker. GET /run — прогон, GET /test — проверка Telegram.');
   },
 };
+
+// фоновое выполнение /run из чата: подтверждение -> прогон -> отчёт
+async function handleRunCommand(env, chatId) {
+  try {
+    await sendTelegramTo(env, chatId, ['⏳ Запускаю проверку hh.ru...']);
+    const result = await runNotifier(env);
+    if (result.sent > 0) {
+      await sendTelegramTo(env, chatId, [`✅ Готово: найдено новых — ${result.fresh}, отправлено.`]);
+    } else if (result.fresh === 0) {
+      await sendTelegramTo(env, chatId, ['✅ Готово: новых вакансий нет.']);
+    }
+  } catch (e) {
+    await sendTelegramTo(env, chatId, ['⚠️ Ошибка прогона: ' + e.message]).catch(() => {});
+  }
+}
 
 const CONFIG = {
   maxAgeHours: 26,
@@ -170,9 +225,10 @@ async function runNotifier(env) {
 
   if (fresh.length === 0) {
     console.log('Новых вакансий нет — сообщение не отправляется');
-    return;
+    return { fresh: 0, sent: 0 };
   }
   await sendTelegram(env, formatMessages(fresh));
+  return { fresh: fresh.length, sent: fresh.length };
 }
 
 function esc(s) {
@@ -207,17 +263,28 @@ function formatMessages(fresh) {
 }
 
 async function sendTelegram(env, texts) {
+  const chatId = Number(env.TELEGRAM_CHAT_ID);
   for (const text of texts) {
     const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: Number(env.TELEGRAM_CHAT_ID),
-        text, parse_mode: 'HTML', disable_web_page_preview: true,
-      }),
+      body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML', disable_web_page_preview: true }),
     });
     const data = await res.json();
     if (!data.ok) throw new Error('Telegram API: ' + (data.description || res.status));
   }
   console.log(`Telegram: отправлено сообщений — ${texts.length}`);
+}
+
+// отправка в указанный чат (для ответов на команды webhook)
+async function sendTelegramTo(env, chatId, texts) {
+  for (const text of texts) {
+    const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, text, disable_web_page_preview: true }),
+    });
+    const data = await res.json();
+    if (!data.ok) throw new Error('Telegram API: ' + (data.description || res.status));
+  }
 }
