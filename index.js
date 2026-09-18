@@ -31,7 +31,8 @@ export default {
       if (msg && msg.text && String(msg.chat.id) === String(env.TELEGRAM_CHAT_ID)) {
         const cmd = msg.text.trim().toLowerCase().split('@')[0];
         if (cmd === '/run') {
-          ctx.waitUntil(handleRunCommand(env, msg.chat.id));
+          // синхронно: waitUntil убивает прогон на ~30-й секунде; Telegram-вебхук ждёт до 60 с
+          await handleRunCommand(env, msg.chat.id);
         } else if (cmd === '/test') {
           ctx.waitUntil(sendTelegramTo(env, msg.chat.id, ['✅ Тест доставки: связь воркер → Telegram работает.']).catch(() => {}));
         } else if (cmd === '/help' || cmd === '/start') {
