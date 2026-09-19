@@ -317,6 +317,7 @@ async function runNotifier(env) {
   const cutoff = Date.now() - CONFIG.maxAgeHours * 3600 * 1000;
   const fresh = [];
   const log = [];
+  const rssFailures = [];
 
   for (const task of buildTasks()) {
     try {
@@ -337,9 +338,22 @@ async function runNotifier(env) {
       log.push(`[${task.name}] загружено ${items.length}: уже показано ${st.dup}, устарело ${st.old}, отсеяно стоп-словом ${st.excluded}, не-руководящих ${st.notLead}, новых ${st.fresh}`);
     } catch (e) {
       log.push(`[${task.name}] ОШИБКА: ${e.message}`);
+      rssFailures.push(`${task.name} (${e.message})`);
     }
     await sleep(1500); // вежливая пауза между запросами
   }
+
+  // алерт при ошибках RSS: только на переходе «работало -> сломалось», чтобы не спамить каждый час
+  const hadFailures = rssFailures.length > 0;
+  if (hadFailures && !state.rssAlerted) {
+    try {
+      await sendTelegram(env, [
+        '⚠️ hh-notifier: ошибки загрузки RSS:\n' + rssFailures.join('\n') +
+        '\n\nЕсли ошибка повторяется (например 403), hh.ru мог ограничить доступ с адресов Cloudflare. Проверьте лог: /run или dashboard.',
+      ]);
+    } catch {}
+  }
+  state.rssAlerted = hadFailures;
 
   // ротация state: держим записи за последние 14 дней
   const stateCutoff = Date.now() - 14 * 86400 * 1000;

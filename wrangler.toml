@@ -2,9 +2,9 @@ name = "hh-notifier"
 main = "index.js"
 compatibility_date = "2026-09-01"
 
-# cron по UTC: 4,6,8,...,18 часов = 07:00–21:00 МСК, каждые 2 часа
+# cron по UTC: 4..18 часов = 07:00–21:00 МСК, каждый час
 [triggers]
-crons = ["0 4,6,8,10,12,14,16,18 * * *"]
+crons = ["0 4-18 * * *"]
 
 # KV для дедупликации; id после создания namespace:
 #   wrangler kv namespace create STATE  ->  вставьте id ниже
