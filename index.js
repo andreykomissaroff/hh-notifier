@@ -185,6 +185,107 @@ function matchesAny(title, keywords) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// --- получение описания вакансии (порт из hh-vacancy-bot: bot-worker.js) ---
+// 1) api.hh.ru/vacancies/{id} (доступен с адресов Cloudflare), 2) фолбэк — парсинг HTML-страницы.
+
+async function fetchVacancyText(id) {
+  let r = await fetch(`https://api.hh.ru/vacancies/${id}`, { headers: { 'User-Agent': CONFIG.userAgent } });
+  if (r.ok) return formatApi(await r.json());
+  if (r.status !== 404) {
+    r = await fetch(`https://hh.ru/vacancy/${id}`, { headers: { 'User-Agent': CONFIG.userAgent, 'Accept-Language': 'ru' } });
+    if (r.ok) return formatPage(await r.text(), id);
+    if (r.status === 404) throw new Error('вакансия не найдена или удалена');
+    throw new Error('hh.ru вернул ' + r.status);
+  }
+  throw new Error('вакансия не найдена или удалена');
+}
+
+function formatApi(v) {
+  const L = [`📌 ${v.name || 'Без названия'}`];
+  if (v.employer?.name) L.push(`Компания: ${v.employer.name}`);
+  if (v.address?.city || v.area?.name) L.push(`Город: ${v.address?.city || v.area.name}`);
+  if (v.work_format?.name) L.push(`Формат: ${v.work_format.name}`);
+  if (v.experience?.name) L.push(`Опыт: ${v.experience.name}`);
+  const s = v.salary;
+  if (s && (s.from || s.to)) {
+    const parts = [];
+    if (s.from) parts.push(`от ${s.from}`);
+    if (s.to) parts.push(`до ${s.to}`);
+    L.push(`Зарплата: ${parts.join(' ')} ${s.currency || ''}${s.gross ? ' (до вычета)' : ' (на руки)'}`);
+  }
+  const extra = [v.schedule?.name, v.employment?.name].filter(Boolean).join(', ');
+  if (extra) L.push(`График: ${extra}`);
+  skillsAndDesc(L, (v.key_skills || []).map((k) => k.name), v.description || '');
+  return L.join('\n');
+}
+
+function formatPage(html, id) {
+  const text = (re, group = 1) => {
+    const m = html.match(re);
+    return m ? stripTags(m[group]).trim() : null;
+  };
+  const ld = (() => {
+    const m = html.match(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/);
+    try { return m ? JSON.parse(m[1]) : {}; } catch { return {}; }
+  })();
+
+  const title = text(/<h1[^>]*data-qa="vacancy-title"[^>]*>([\s\S]*?)<\/h1>/) || ld.title || 'Вакансия';
+  const L = [`📌 ${title}`];
+  const company = text(/data-qa="vacancy-company-name"[^>]*>([\s\S]*?)<\/a>/) || ld.hiringOrganization?.name;
+  if (company) L.push(`Компания: ${stripTags(company).trim()}`);
+  const city = ld.jobLocation?.address?.addressLocality;
+  if (city) L.push(`Город: ${city}`);
+  const exp = text(/data-qa="vacancy-experience"[^>]*>([\s\S]*?)<\/span>/);
+  if (exp) L.push(`Опыт: ${exp}`);
+  const salary = text(/data-qa="vacancy-salary"[^>]*>([\s\S]*?)<\/div>/);
+  if (salary && !/не указан/.test(salary)) L.push(`Зарплата: ${salary}`);
+
+  const skills = (() => {
+    const m = html.match(/&#34;keySkills&#34;:\{&#34;keySkill&#34;:\[([\s\S]*?)\]/);
+    if (!m) return [];
+    return (m[1].replace(/&#34;/g, '"').replace(/&amp;/g, '&').match(/"[^"]+"/g) || [])
+      .map((s) => s.slice(1, -1));
+  })();
+  skillsAndDesc(L, skills, ld.description || '');
+  return L.join('\n');
+}
+
+function skillsAndDesc(L, skills, descHtml) {
+  if (skills.length) L.push('\nКлючевые навыки:\n' + skills.map((s) => '• ' + s).join('\n'));
+  const d = cleanHtml(descHtml);
+  if (d) L.push(`\nОписание:\n${d}`);
+}
+
+function cleanHtml(html) {
+  return (html || '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<li[^>]*>/gi, '\n• ')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function stripTags(s) {
+  return cleanHtml(s);
+}
+
+// разбиение длинного текста на сообщения (лимит Telegram 4096, держим запас)
+function splitText(text, limit = 3800) {
+  if (text.length <= limit) return [text];
+  const parts = [];
+  let cur = '';
+  for (const para of text.split('\n')) {
+    let p = para;
+    while (p.length > limit) { parts.push(p.slice(0, limit)); p = p.slice(limit); }
+    if (cur.length + p.length + 1 > limit) { parts.push(cur); cur = p; }
+    else cur = cur ? cur + '\n' + p : p;
+  }
+  if (cur) parts.push(cur);
+  return parts;
+}
+
 async function runNotifier(env) {
   let state = await env.STATE.get('state', 'json');
   if (!state || !state.seen) state = { seen: {} };
@@ -213,7 +314,7 @@ async function runNotifier(env) {
     } catch (e) {
       log.push(`[${task.name}] ОШИБКА: ${e.message}`);
     }
-    await sleep(2000); // вежливая пауза между запросами
+    await sleep(1500); // вежливая пауза между запросами
   }
 
   // ротация state: держим записи за последние 14 дней
@@ -228,6 +329,18 @@ async function runNotifier(env) {
     console.log('Новых вакансий нет — сообщение не отправляется');
     return { fresh: 0, sent: 0 };
   }
+
+  // обогащение: описание каждой вакансии (api.hh.ru -> HTML-фолбэк), пауза между запросами
+  for (const v of fresh) {
+    try {
+      v.details = await fetchVacancyText(v.id);
+    } catch (e) {
+      console.log(`[{${v.id}}] описание недоступно: ${e.message}`);
+      v.details = '';
+    }
+    await sleep(800);
+  }
+
   await sendTelegram(env, formatMessages(fresh));
   return { fresh: fresh.length, sent: fresh.length };
 }
@@ -236,11 +349,16 @@ const fmtMSK = new Intl.DateTimeFormat('ru-RU', {
   timeZone: 'Europe/Moscow', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit',
 });
 
-// каждое сообщение — чистая ссылка на вакансию; первым идёт заголовок с общим числом
+// каждое сообщение — ссылка + описание вакансии; первым идёт заголовок
 function formatMessages(fresh) {
   const header = `hh.ru: новых вакансий — ${fresh.length} (${fmtMSK.format(Date.now())})`;
   const sorted = fresh.sort((a, b) => a.search.localeCompare(b.search));
-  return [header, ...sorted.map((v) => v.link)];
+  const msgs = [header];
+  for (const v of sorted) {
+    const text = v.details ? v.link + '\n\n' + v.details : v.link;
+    msgs.push(...splitText(text));
+  }
+  return msgs;
 }
 
 async function sendTelegram(env, texts) {
@@ -250,7 +368,7 @@ async function sendTelegram(env, texts) {
     const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId, text: texts[i], parse_mode: 'HTML', disable_web_page_preview: true }),
+      body: JSON.stringify({ chat_id: chatId, text: texts[i], disable_web_page_preview: true }),
     });
     const data = await res.json();
     if (!data.ok) throw new Error('Telegram API: ' + (data.description || res.status));
