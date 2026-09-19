@@ -41,9 +41,18 @@ export default {
             '/run — проверить hh.ru прямо сейчас (пришлю вакансии, если появились новые)',
             '/test — проверить доставку сообщений',
             '/help — эта справка',
+            '',
+            'Пришлите ссылку на вакансию hh.ru (можно с любым «хвостом» после цифр или переслать шаринг) — пришлю очищенное описание.',
           ].join('\n')).catch(() => {}));
         } else {
-          ctx.waitUntil(sendTelegramTo(env, msg.chat.id, ['Не знаю такую команду. Доступно: /run, /test, /help']).catch(() => {}));
+          // не команда: если в тексте есть ссылки на вакансии — выдать их описания
+          const ids = [...new Set((msg.text.match(/hh\.ru\/vacancy\/(\d+)/gi) || [])
+            .map((s) => s.match(/(\d+)$/)[1]))];
+          if (ids.length) {
+            await handleVacancyLookup(env, msg.chat.id, ids);
+          } else {
+            ctx.waitUntil(sendTelegramTo(env, msg.chat.id, ['Не знаю такую команду. Доступно: /run, /test, /help. Можно прислать ссылку на вакансию hh.ru — пришлю описание.']).catch(() => {}));
+          }
         }
       }
       // Telegram ждёт быстрый 200; работа продолжается в фоне
@@ -65,6 +74,21 @@ export default {
     return new Response('hh-notifier worker. GET /run — прогон, GET /test — проверка Telegram.');
   },
 };
+
+// присланные ссылки: ссылка -> очищенное описание (функциональность старого @clean_hh_vacancies_bot)
+async function handleVacancyLookup(env, chatId, ids) {
+  for (const id of ids) {
+    try {
+      const text = await fetchVacancyText(id);
+      for (const part of splitText('https://hh.ru/vacancy/' + id + '\n\n' + text)) {
+        await sendTelegramTo(env, chatId, [part]);
+      }
+    } catch (e) {
+      await sendTelegramTo(env, chatId, ['Не удалось получить вакансию: ' + e.message]).catch(() => {});
+    }
+    await sleep(800);
+  }
+}
 
 // фоновое выполнение /run из чата: подтверждение -> прогон -> отчёт
 async function handleRunCommand(env, chatId) {
