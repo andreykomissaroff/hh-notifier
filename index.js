@@ -42,7 +42,7 @@ export default {
             '/test — проверить доставку сообщений',
             '/help — эта справка',
             '',
-            'Пришлите ссылку на вакансию hh.ru (можно с любым «хвостом» после цифр или переслать шаринг) — пришлю очищенное описание.',
+            'Пришлите ссылку на вакансию hh.ru (можно с любым «хвостом» после цифр или переслать шаринг) — пришлю очищенное описание; такая вакансия помечается обработанной и в дайджест больше не попадает.',
           ].join('\n')).catch(() => {}));
         } else {
           // не команда: если в тексте есть ссылки на вакансии — выдать их описания
@@ -75,9 +75,16 @@ export default {
   },
 };
 
-// присланные ссылки: ссылка -> очищенное описание (функциональность старого @clean_hh_vacancies_bot)
+// присланные ссылки: ссылка -> очищенное описание; вакансия помечается отработанной
+// (state.seen) и в регулярный дайджест больше не попадает
 async function handleVacancyLookup(env, chatId, ids) {
+  let state = await env.STATE.get('state', 'json');
+  if (!state || !state.seen) state = { seen: {} };
+  const nowStamp = new Date().toISOString();
   for (const id of ids) {
+    // помечаем отработанной сразу: сам факт «показал ссылкой» = обработано,
+    // даже если описание получить не удалось
+    state.seen[id] = nowStamp;
     try {
       const text = await fetchVacancyText(id);
       for (const part of splitText('https://hh.ru/vacancy/' + id + '\n\n' + text)) {
@@ -88,6 +95,7 @@ async function handleVacancyLookup(env, chatId, ids) {
     }
     await sleep(800);
   }
+  await env.STATE.put('state', JSON.stringify(state));
 }
 
 // фоновое выполнение /run из чата: подтверждение -> прогон -> отчёт
