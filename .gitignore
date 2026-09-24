@@ -1,6 +1,5 @@
 .webhook-secret
 tail.log
-.webhook-secret
-tail.log
 PLAN-migration-yandex-hybrid.md
 initial-state.json
+.wrangler/
