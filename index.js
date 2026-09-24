@@ -30,6 +30,7 @@ export default {
       // нажатие inline-кнопок реакции
       if (update.callback_query) {
         const cq = update.callback_query;
+        console.log('callback_query: ' + cq.data + ' от чата ' + cq.message?.chat?.id);
         if (String(cq.message?.chat?.id) === String(env.TELEGRAM_CHAT_ID)) {
           await handleFeedback(env, cq);
         }
@@ -71,6 +72,13 @@ export default {
       }
       // Telegram ждёт быстрый 200; работа продолжается в фоне
       return new Response('OK');
+    }
+
+    // диагностика webhook: /diag?key=СЕКРЕТ — getWebhookInfo (последние ошибки доставки)
+    if (url.pathname === '/diag' && env.TELEGRAM_WEBHOOK_SECRET && url.searchParams.get('key') === env.TELEGRAM_WEBHOOK_SECRET) {
+      const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getWebhookInfo`);
+      const data = await res.json();
+      return new Response(JSON.stringify(data, null, 2), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
 
     // подключение webhook (защищено тем же секретом): /setup?key=СЕКРЕТ
@@ -452,9 +460,10 @@ function scoreVacancy(c, weights) {
 
 function feedbackKeyboard(id, v) {
   v = v || 0;
+  // одобряющая кнопка справа
   return { inline_keyboard: [[
-    { text: v === 1 ? '👍 ✅' : '👍', callback_data: 'fb:up:' + id },
     { text: v === -1 ? '👎 ✅' : '👎', callback_data: 'fb:down:' + id },
+    { text: v === 1 ? '👍 ✅' : '👍', callback_data: 'fb:up:' + id },
   ]] };
 }
 
