@@ -99,7 +99,7 @@ async function handleVacancyLookup(env, chatId, ids) {
     // даже если описание получить не удалось
     state.seen[id] = nowStamp;
     try {
-      const text = await fetchVacancyText(id);
+      const text = await fetchVacancyText(id, state, true);
       const title = (text.match(/📌\s*(.+)/) || [, ''])[1].trim();
       state.vacWords[id] = { w: extractWordsFromVacancy(title, text), s: 'ссылка', t: nowStamp };
       for (const part of splitText('https://hh.ru/vacancy/' + id + '\n\n' + text)) {
@@ -132,10 +132,13 @@ async function handleRunCommand(env, chatId) {
 const CONFIG = {
   maxAgeHours: 26,
   userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) hh-notifier/2.0',
-  // реакционное обучение: авто-скрытие вакансий с сильно негативным рейтингом слов названия
+  // реакционное обучение: авто-скрытие вакансий с сильно негативным рейтингом
   negativeScoreToSkip: -2,
-  minWeightedWords: 2,
+  minWeightedWords: 3,        // текстовый скоринг: минимум «знакомых» слов
+  titleMinWeightedWords: 2,   // скоринг по названию (текст недоступен или сверх потолка)
   wordWeightCap: 5,
+  maxEnrichPerRun: 10,        // потолок скачиваний описаний за прогон (защита от всплесков)
+  enrichPauseMs: 1200,
 
   // поисковые запросы: text ищется в названии вакансии (search_field=name), area: 1 = Москва
   searches: [
@@ -239,17 +242,22 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // --- получение описания вакансии (порт из hh-vacancy-bot: bot-worker.js) ---
 // 1) api.hh.ru/vacancies/{id} (доступен с адресов Cloudflare), 2) фолбэк — парсинг HTML-страницы.
-
-async function fetchVacancyText(id) {
-  let r = await fetch(`https://api.hh.ru/vacancies/${id}`, { headers: { 'User-Agent': CONFIG.userAgent } });
-  if (r.ok) return formatApi(await r.json());
-  if (r.status !== 404) {
-    r = await fetch(`https://hh.ru/vacancy/${id}`, { headers: { 'User-Agent': CONFIG.userAgent, 'Accept-Language': 'ru' } });
-    if (r.ok) return formatPage(await r.text(), id);
+// state/allowApi: кэш отказа API — если api.hh.ru отказал, сутки ходим сразу по HTML,
+// чтобы не удваивать запросы на каждого кандидата.
+async function fetchVacancyText(id, state, allowApi) {
+  if (allowApi) {
+    const r = await fetch(`https://api.hh.ru/vacancies/${id}`, { headers: { 'User-Agent': CONFIG.userAgent } });
+    if (r.ok) return formatApi(await r.json());
     if (r.status === 404) throw new Error('вакансия не найдена или удалена');
-    throw new Error('hh.ru вернул ' + r.status);
+    if (state) {
+      state.apiDisabledUntil = new Date(Date.now() + 24 * 86400 * 1000).toISOString();
+      console.log('api.hh.ru отказал (' + r.status + ') — сутки используем только HTML-фолбэк');
+    }
   }
-  throw new Error('вакансия не найдена или удалена');
+  const r2 = await fetch(`https://hh.ru/vacancy/${id}`, { headers: { 'User-Agent': CONFIG.userAgent, 'Accept-Language': 'ru' } });
+  if (r2.ok) return formatPage(await r2.text(), id);
+  if (r2.status === 404) throw new Error('вакансия не найдена или удалена');
+  throw new Error('hh.ru вернул ' + r2.status);
 }
 
 function formatApi(v) {
@@ -343,6 +351,9 @@ function splitText(text, limit = 3800) {
 async function loadState(env) {
   let state = await env.STATE.get('state', 'json');
   if (!state || !state.seen) state = { seen: {} };
+  state.vacWords = state.vacWords || {};
+  state.wordWeights = state.wordWeights || {};
+  state.feedback = state.feedback || {};
   return state;
 }
 
@@ -352,6 +363,12 @@ const FEEDBACK_STOP_EXACT = new Set([
   'зарплата', 'формат', 'оригинал', 'описание', 'навыки', 'ключевые', 'график', 'работа',
   'вакансия', 'требования', 'обязанности', 'условия', 'занятость', 'сменный', 'гибкий',
   'удаленно', 'удалённо', 'гибрид', 'на', 'руки', 'вычета', 'года', 'лет', 'банк',
+  // типовой шум тел описаний вакансий
+  'знание', 'знания', 'знанием', 'будет', 'команд', 'команде', 'задач', 'задачи',
+  'проект', 'проекта', 'проектов', 'требуется', 'требуются', 'приветствуется',
+  'понимание', 'развитие', 'развития', 'результат', 'результатов', 'клиент',
+  'клиентов', 'клиентам', 'более', 'менее', 'оформление', 'оплата', 'испытательный',
+  'срок', 'резюме', 'отклик', 'отклику', 'вакансии', 'вакансию', 'работодатель',
 ]);
 const FEEDBACK_STOP_PREFIXES = [
   'руковод', 'начальн', 'директор', 'заместит', 'помощник', 'ассистент', 'главный',
@@ -397,6 +414,40 @@ function titleScore(title, weights) {
     if (wt !== 0) { sum += wt; counted++; }
   }
   return { sum, counted, words };
+}
+
+// текстовый скоринг кандидата: название и навыки ×1.0, тело описания ×0.5
+// (и только слова с |весом| ≥ 2 — одиночная реакция на текст «инертна» до подкрепления)
+function scoreVacancy(c, weights) {
+  const details = c.details || '';
+  if (!details) {
+    const s = titleScore(c.title, weights);
+    return {
+      skip: s.counted >= CONFIG.titleMinWeightedWords && s.sum <= CONFIG.negativeScoreToSkip,
+      sum: s.sum, counted: s.counted,
+    };
+  }
+  const titleWords = extractWords(c.title);
+  const skillsWords = extractSkillsWords(details);
+  const namedSet = new Set([...titleWords, ...skillsWords]);
+  const bodyWords = extractWords(details).filter((w) => !namedSet.has(w));
+  let sum = 0, counted = 0;
+  for (const w of titleWords) {
+    const wt = weights[w] || 0;
+    if (wt !== 0) { sum += wt; counted++; }
+  }
+  for (const w of skillsWords) {
+    const wt = weights[w] || 0;
+    if (wt !== 0) { sum += wt; counted++; }
+  }
+  for (const w of bodyWords) {
+    const wt = weights[w] || 0;
+    if (Math.abs(wt) >= 2) { sum += wt * 0.5; counted++; }
+  }
+  return {
+    skip: counted >= CONFIG.minWeightedWords && sum <= CONFIG.negativeScoreToSkip,
+    sum, counted,
+  };
 }
 
 function feedbackKeyboard(id) {
@@ -489,7 +540,7 @@ async function runNotifier(env) {
   const state = await loadState(env);
   const repliedSet = new Set(CONFIG.repliedIds);
   const cutoff = Date.now() - CONFIG.maxAgeHours * 3600 * 1000;
-  const fresh = [];
+  const candidates = []; // прошли структурные фильтры; судьба решается по полному тексту
   const log = [];
   const rssFailures = [];
 
@@ -498,26 +549,20 @@ async function runNotifier(env) {
       const res = await fetch(task.url, { headers: { 'User-Agent': CONFIG.userAgent } });
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const items = parseItems(await res.text());
-      const st = { dup: 0, old: 0, excluded: 0, notLead: 0, byScore: 0, fresh: 0 };
+      const st = { dup: 0, old: 0, excluded: 0, notLead: 0, cand: 0 };
       for (const it of items) {
         if (!it.id) continue;
         if (state.seen[it.id] || repliedSet.has(it.id)) { st.dup++; continue; }
         if (it.pub < cutoff) { st.old++; continue; }
         if (matchesAny(it.title, CONFIG.excludeKeywords)) { st.excluded++; continue; }
         if (task.isCompany && !matchesAny(it.title, CONFIG.leadershipKeywords)) { st.notLead++; continue; }
-        // реакционное обучение: консервативное авто-скрытие явно нерелевантных
-        const score = titleScore(it.title, state.wordWeights || {});
-        if (score.counted >= CONFIG.minWeightedWords && score.sum <= CONFIG.negativeScoreToSkip) {
-          st.byScore++;
-          state.autoSkippedCount = (state.autoSkippedCount || 0) + 1;
-          state.autoSkippedLog = [...(state.autoSkippedLog || []), { t: new Date().toISOString(), title: it.title, score: score.sum }].slice(-5);
-          continue;
-        }
-        fresh.push({ ...it, search: task.name, words: score.words });
+        candidates.push({ ...it, search: task.name });
+        // кандидат будет скачан и оценён — помечаем обработанной независимо от исхода,
+        // чтобы не перекачивать его при следующих прогонах
         state.seen[it.id] = new Date().toISOString();
-        st.fresh++;
+        st.cand++;
       }
-      log.push(`[${task.name}] загружено ${items.length}: уже показано ${st.dup}, устарело ${st.old}, отсеяно стоп-словом ${st.excluded}, не-руководящих ${st.notLead}, рейтингом ${st.byScore}, новых ${st.fresh}`);
+      log.push(`[${task.name}] загружено ${items.length}: уже показано ${st.dup}, устарело ${st.old}, отсеяно стоп-словом ${st.excluded}, не-руководящих ${st.notLead}, кандидатов ${st.cand}`);
     } catch (e) {
       log.push(`[${task.name}] ОШИБКА: ${e.message}`);
       rssFailures.push(`${task.name} (${e.message})`);
@@ -542,33 +587,65 @@ async function runNotifier(env) {
   for (const id of Object.keys(state.seen)) {
     if (Date.parse(state.seen[id]) < stateCutoff) delete state.seen[id];
   }
+
+  // обогащение + текстовый скоринг: скачали -> оценили -> решили.
+  // Потолок на прогон; сверх потолка — скор по названию.
+  let allowApi = Date.parse(state.apiDisabledUntil || 0) < Date.now();
+  const fresh = [];
+  let hiddenByScore = 0;
+  let descFailures = 0;
+  for (let i = 0; i < candidates.length; i++) {
+    const c = candidates[i];
+    if (i < CONFIG.maxEnrichPerRun) {
+      try {
+        c.details = await fetchVacancyText(c.id, state, allowApi);
+        // API отказал в этом прогоне — остальные кандидаты идут сразу по HTML
+        if (state.apiDisabledUntil && Date.parse(state.apiDisabledUntil) > Date.now()) allowApi = false;
+      } catch (e) {
+        if (/не найдена или удалена/.test(e.message)) {
+          log.push(`[${c.search}] вакансия ${c.id} удалена — пропущена`);
+        } else {
+          descFailures++;
+          console.log(`[${c.id}] описание недоступно: ${e.message}`);
+        }
+        c.details = '';
+      }
+      await sleep(CONFIG.enrichPauseMs);
+    }
+    const scored = scoreVacancy(c, state.wordWeights || {});
+    if (scored.skip) {
+      hiddenByScore++;
+      state.autoSkippedCount = (state.autoSkippedCount || 0) + 1;
+      state.autoSkippedLog = [...(state.autoSkippedLog || []), { t: new Date().toISOString(), title: c.title, score: scored.sum }].slice(-5);
+      continue;
+    }
+    fresh.push({ ...c, score: scored.sum, counted: scored.counted });
+  }
+
+  // алерт при ошибках описаний: только на переходе «работало -> сломалось»
+  const descAlert = descFailures >= 2;
+  if (descAlert && !state.descAlerted) {
+    try {
+      await sendTelegram(env, ['⚠️ hh-notifier: не удалось получить описания ' + descFailures + ' вакансий — возможна капча/ограничения hh.ru. Проверьте /run или dashboard.']);
+    } catch {}
+  }
+  state.descAlerted = descAlert;
+
+  // словарь слов отправляемых вакансий для реакционного обучения (полный текст)
+  const nowIso = new Date().toISOString();
+  for (const v of fresh) {
+    state.vacWords[v.id] = { w: extractWordsFromVacancy(v.title, v.details || ''), s: v.search, t: nowIso };
+  }
+  pruneFeedbackData(state);
   await env.STATE.put('state', JSON.stringify(state));
+
+  log.push(`Текстовый скоринг: кандидатов ${candidates.length}, скрыто рейтингом ${hiddenByScore}, к отправке ${fresh.length}, сбоев описаний ${descFailures}`);
   console.log(log.join('\n'));
 
   if (fresh.length === 0) {
     console.log('Новых вакансий нет — сообщение не отправляется');
     return { fresh: 0, sent: 0 };
   }
-
-  // обогащение: описание каждой вакансии (api.hh.ru -> HTML-фолбэк), пауза между запросами
-  for (const v of fresh) {
-    try {
-      v.details = await fetchVacancyText(v.id);
-    } catch (e) {
-      console.log(`[{${v.id}}] описание недоступно: ${e.message}`);
-      v.details = '';
-    }
-    await sleep(800);
-  }
-
-  // словарь слов вакансий для реакционного обучения (название + ключевые навыки)
-  const nowIso = new Date().toISOString();
-  for (const v of fresh) {
-    state.vacWords[v.id] = { w: uniq([...(v.words || []), ...extractSkillsWords(v.details)]), s: v.search, t: nowIso };
-  }
-  pruneFeedbackData(state);
-  await env.STATE.put('state', JSON.stringify(state));
-
   await sendTelegram(env, formatMessages(fresh));
   return { fresh: fresh.length, sent: fresh.length };
 }
