@@ -478,8 +478,30 @@ async function handleFeedback(env, cq) {
     pruneFeedbackData(state);
     await env.STATE.put('state', JSON.stringify(state));
     await answerCallbackQuery(env, cq.id, dir > 0 ? 'Учтено: 👍 высоко релевантная' : 'Учтено: 👎 похожие буду скрывать');
+    // видимость: выбранная кнопка помечается галочкой прямо на сообщении
+    await markReactionOnMessage(env, cq.message.chat.id, cq.message.message_id, id, dir);
   } catch (e) {
     console.error('feedback error: ' + e.message);
+  }
+}
+
+// помечает выбранную кнопку галочкой (кнопки остаются — можно переголосовать)
+async function markReactionOnMessage(env, chatId, messageId, vacancyId, dir) {
+  try {
+    await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/editMessageReplyMarkup`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        message_id: messageId,
+        reply_markup: { inline_keyboard: [[
+          { text: dir > 0 ? '👍 ✅' : '👍', callback_data: 'fb:up:' + vacancyId },
+          { text: dir < 0 ? '👎 ✅' : '👎', callback_data: 'fb:down:' + vacancyId },
+        ]] },
+      }),
+    });
+  } catch (e) {
+    console.error('markReaction error: ' + e.message);
   }
 }
 
