@@ -20,25 +20,27 @@ export function feedbackKeyboard(id, v) {
   ]] };
 }
 
-// texts: строки или { text, vacancyId } — для вакансий добавляются кнопки 👍/👎
+// texts: массив строк/объектов { text, vacancyId } или одна строка
 export async function sendTelegram(env, texts) {
+  const list = typeof texts === 'string' ? [texts] : texts;
   const chatId = Number(env.TELEGRAM_CHAT_ID);
-  for (let i = 0; i < texts.length; i++) {
+  for (let i = 0; i < list.length; i++) {
     if (i > 0) await sleep(400); // лимит Telegram ~1 сообщение/сек на чат
-    const t = typeof texts[i] === 'string' ? { text: texts[i] } : texts[i];
+    const t = typeof list[i] === 'string' ? { text: list[i] } : list[i];
     const body = { chat_id: chatId, text: t.text, disable_web_page_preview: true };
     if (t.vacancyId) body.reply_markup = feedbackKeyboard(t.vacancyId);
     const data = await tgFetch(env, 'sendMessage', body);
     if (!data.ok) throw new Error('Telegram API: ' + (data.description || 'send error'));
   }
-  console.log(`Telegram: отправлено сообщений — ${texts.length}`);
+  console.log(`Telegram: отправлено сообщений — ${list.length}`);
 }
 
 // отправка в указанный чат (ответы на команды, онбординг, присланные ссылки)
 export async function sendTelegramTo(env, chatId, texts) {
-  for (let i = 0; i < texts.length; i++) {
+  const list = typeof texts === 'string' ? [texts] : texts;
+  for (let i = 0; i < list.length; i++) {
     if (i > 0) await sleep(400);
-    const t = typeof texts[i] === 'string' ? { text: texts[i] } : texts[i];
+    const t = typeof list[i] === 'string' ? { text: list[i] } : list[i];
     const body = { chat_id: chatId, text: t.text, disable_web_page_preview: true };
     if (t.vacancyId) body.reply_markup = feedbackKeyboard(t.vacancyId);
     const data = await tgFetch(env, 'sendMessage', body);
