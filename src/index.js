@@ -6,6 +6,7 @@ import { runNotifier } from './notifier.js';
 import { fetchVacancyText } from './enrich.js';
 import { extractWordsFromVacancy } from './scoring.js';
 import { handleFeedback, formatStats } from './learn.js';
+import { onboardingText, handleResume, confirmProfile, hasProfile } from './onboard.js';
 import { sendTelegramTo, splitText } from './telegram.js';
 import { sleep } from './util.js';
 
@@ -64,9 +65,26 @@ export default {
 
       const msg = update.message;
       // команды принимает только ваш чат
-      if (msg && msg.text && String(msg.chat.id) === String(env.TELEGRAM_CHAT_ID)) {
-        const cmd = msg.text.trim().toLowerCase().split('@')[0];
-        if (cmd === '/run') {
+      if (msg && (msg.text || msg.document) && String(msg.chat.id) === String(env.TELEGRAM_CHAT_ID)) {
+        const text = (msg.text || '').trim();
+        const cmd = msg.text ? text.toLowerCase().split('@')[0].split(/\s+/)[0] : '';
+
+        // файл .txt с резюме (caption команды /resume)
+        if (msg.document && /\.txt$/i.test(msg.document.file_name || '') && /^\/resume/.test((msg.caption || '').toLowerCase())) {
+          ctx.waitUntil(handleResumeFile(env, msg.chat.id, msg.document.file_id).catch(() => {}));
+          return new Response('OK');
+        }
+
+        if (cmd === '/resume' || !msg.text) {
+          const resumeText = text.replace(/^\/resume\s*/i, '');
+          if (resumeText.length < 200) {
+            ctx.waitUntil(sendTelegramTo(env, msg.chat.id, ['Пришлите текст резюме после команды /resume (или файлом .txt с подписью /resume). Нужно хотя бы разделы «Желаемая должность», «Опыт» и «Навыки».']).catch(() => {}));
+          } else {
+            ctx.waitUntil(handleResume(env, msg.chat.id, resumeText).catch((e) => sendTelegramTo(env, msg.chat.id, ['⚠️ ' + e.message]).catch(() => {})));
+          }
+        } else if (cmd === '/confirm-profile') {
+          ctx.waitUntil(confirmProfile(env, msg.chat.id).catch(() => {}));
+        } else if (cmd === '/run') {
           // синхронно: waitUntil убивает прогон на ~30-й секунде; Telegram-вебхук ждёт до 60 с
           await handleRunCommand(env, msg.chat.id);
         } else if (cmd === '/test') {
@@ -74,7 +92,8 @@ export default {
         } else if (cmd === '/stats') {
           ctx.waitUntil(sendTelegramTo(env, msg.chat.id, [await formatStats(env)]).catch(() => {}));
         } else if (cmd === '/help' || cmd === '/start') {
-          ctx.waitUntil(sendTelegramTo(env, msg.chat.id, helpText()).catch(() => {}));
+          const onboarded = await hasProfile(env);
+          ctx.waitUntil(sendTelegramTo(env, msg.chat.id, onboarded ? helpText() : [helpText(), '', onboardingText()].join('\n\n')).catch(() => {}));
         } else {
           // не команда: если в тексте есть ссылки на вакансии — выдать их описания
           const ids = [...new Set((msg.text.match(/hh\.ru\/vacancy\/(\d+)/gi) || [])
@@ -100,11 +119,25 @@ function helpText() {
     '/run — проверить hh.ru прямо сейчас (пришлю вакансии, если появились новые)',
     '/test — проверить доставку сообщений',
     '/stats — статистика ваших реакций и обучения фильтра',
+    '/resume <текст или файл .txt> — извлечь профиль из резюме и сгенерировать поиск заново',
+    '/confirm-profile — сохранить черновик профиля',
     '/help — эта справка',
     '',
     'Под каждым сообщением вакансии — кнопки 👍/👎: высоко/низко релевантная. 👎 учит фильтр скрывать похожие (консервативно), отсутствие реакции — нейтрально.',
     'Пришлите ссылку на вакансию hh.ru (можно с любым «хвостом» после цифр или переслать шаринг) — пришлю очищенное описание; такая вакансия помечается обработанной и в дайджест больше не попадает.',
   ].join('\n');
+}
+
+// скачивание файла .txt из Telegram и извлечение профиля
+async function handleResumeFile(env, chatId, fileId) {
+  try {
+    const meta = await (await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getFile?file_id=${fileId}`)).json();
+    if (!meta.ok) throw new Error('не удалось получить файл: ' + (meta.description || ''));
+    const content = await (await fetch(`https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${meta.result.file_path}`)).text();
+    await handleResume(env, chatId, content);
+  } catch (e) {
+    await sendTelegramTo(env, chatId, ['⚠️ ' + e.message]).catch(() => {});
+  }
 }
 
 // фоновое выполнение /run из чата: подтверждение -> прогон -> отчёт

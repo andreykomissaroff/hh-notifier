@@ -2,6 +2,11 @@ name = "hh-notifier"
 main = "src/index.js"
 compatibility_date = "2026-09-01"
 
+# Workers AI: онбординг (извлечение профиля из резюме). Бесплатный тариф покрывает с запасом.
+# При деплое через dashboard: Settings -> Bindings -> Add -> Workers AI -> имя переменной AI.
+[ai]
+binding = "AI"
+
 # cron по UTC: 4..18 часов = 07:00–21:00 МСК, каждый час
 [triggers]
 crons = ["0 4-18 * * *"]
