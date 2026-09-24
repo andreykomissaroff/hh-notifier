@@ -29,10 +29,18 @@ export default {
       return new Response('OK: тестовое сообщение отправлено в Telegram');
     }
 
-    // диагностика webhook: /diag?key=СЕКРЕТ — getWebhookInfo (последние ошибки доставки)
+    // диагностика: /diag?key=СЕКРЕТ — webhook-info + состояние профиля
     if (url.pathname === '/diag' && env.TELEGRAM_WEBHOOK_SECRET && url.searchParams.get('key') === env.TELEGRAM_WEBHOOK_SECRET) {
-      const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getWebhookInfo`);
-      const data = await res.json();
+      const [hookRes, profile, state] = await Promise.all([
+        fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getWebhookInfo`).then((r) => r.json()),
+        loadProfile(env),
+        loadState(env),
+      ]);
+      const data = {
+        webhook: hookRes.result,
+        profile: profile ? { title: profile.title || '', roles: profile.roles?.length || 0, searches: profile.searches?.length || 0 } : null,
+        state: { seen: Object.keys(state.seen).length, weights: Object.keys(state.wordWeights || {}).length, feedback: Object.keys(state.feedback || {}).length },
+      };
       return new Response(JSON.stringify(data, null, 2), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
 
