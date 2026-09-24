@@ -450,43 +450,54 @@ function scoreVacancy(c, weights) {
   };
 }
 
-function feedbackKeyboard(id) {
+function feedbackKeyboard(id, v) {
+  v = v || 0;
   return { inline_keyboard: [[
-    { text: '👍', callback_data: 'fb:up:' + id },
-    { text: '👎', callback_data: 'fb:down:' + id },
+    { text: v === 1 ? '👍 ✅' : '👍', callback_data: 'fb:up:' + id },
+    { text: v === -1 ? '👎 ✅' : '👎', callback_data: 'fb:down:' + id },
   ]] };
 }
 
-// нажатие 👍/👎: сдвиг весов слов вакансии, счётчики, ротация
+// нажатие 👍/👎: у вакансии три состояния — высокая (+1) / нейтральная (0) / низкая (−1).
+// Другая реакция заменяет предыдущую, повтор той же — снимает её (возврат в нейтральную).
+// Веса слов сдвигаются на разницу состояний.
 async function handleFeedback(env, cq) {
   try {
     const dir = cq.data.startsWith('fb:up:') ? 1 : cq.data.startsWith('fb:down:') ? -1 : 0;
     const id = cq.data.split(':')[2];
     if (!dir || !id) { await answerCallbackQuery(env, cq.id, 'Не распознано'); return; }
     const state = await loadState(env);
-    state.fbCounts = state.fbCounts || { up: 0, down: 0 };
-    state.fbCounts[dir > 0 ? 'up' : 'down']++;
     const entry = (state.vacWords || {})[id];
+    const prev = (state.feedback || {})[id]?.v || 0;
+    const next = prev === dir ? 0 : dir; // повтор — снять реакцию
+    const delta = next - prev;
+
     const words = entry ? entry.w : [];
     state.wordWeights = state.wordWeights || {};
     for (const w of words) {
-      const next = Math.max(-CONFIG.wordWeightCap, Math.min(CONFIG.wordWeightCap, (state.wordWeights[w] || 0) + dir));
-      state.wordWeights[w] = next;
+      state.wordWeights[w] = Math.max(-CONFIG.wordWeightCap, Math.min(CONFIG.wordWeightCap, (state.wordWeights[w] || 0) + delta));
     }
+
     state.feedback = state.feedback || {};
-    state.feedback[id] = { v: dir, t: new Date().toISOString(), s: entry ? entry.s : '' };
+    state.feedback[id] = { v: next, t: new Date().toISOString(), s: entry ? entry.s : '' };
     pruneFeedbackData(state);
     await env.STATE.put('state', JSON.stringify(state));
-    await answerCallbackQuery(env, cq.id, dir > 0 ? 'Учтено: 👍 высоко релевантная' : 'Учтено: 👎 похожие буду скрывать');
-    // видимость: выбранная кнопка помечается галочкой прямо на сообщении
-    await markReactionOnMessage(env, cq.message.chat.id, cq.message.message_id, id, dir);
+
+    const answers = {
+      '1': 'Учтено: вакансия высокой релевантности (👍)',
+      '0': 'Учтено: реакция снята — вакансия нейтральная',
+      '-1': 'Учтено: вакансия низкой релевантности (👎)',
+    };
+    await answerCallbackQuery(env, cq.id, answers[String(next)]);
+    // видимость: галочка на кнопке текущего состояния
+    await markReactionOnMessage(env, cq.message.chat.id, cq.message.message_id, id, next);
   } catch (e) {
     console.error('feedback error: ' + e.message);
   }
 }
 
-// помечает выбранную кнопку галочкой (кнопки остаются — можно переголосовать)
-async function markReactionOnMessage(env, chatId, messageId, vacancyId, dir) {
+// помечает на сообщении кнопку текущего состояния вакансии (кнопки остаются)
+async function markReactionOnMessage(env, chatId, messageId, vacancyId, vote) {
   try {
     await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/editMessageReplyMarkup`, {
       method: 'POST',
@@ -494,10 +505,7 @@ async function markReactionOnMessage(env, chatId, messageId, vacancyId, dir) {
       body: JSON.stringify({
         chat_id: chatId,
         message_id: messageId,
-        reply_markup: { inline_keyboard: [[
-          { text: dir > 0 ? '👍 ✅' : '👍', callback_data: 'fb:up:' + vacancyId },
-          { text: dir < 0 ? '👎 ✅' : '👎', callback_data: 'fb:down:' + vacancyId },
-        ]] },
+        reply_markup: feedbackKeyboard(vacancyId, vote),
       }),
     });
   } catch (e) {
@@ -537,8 +545,10 @@ function pruneFeedbackData(state) {
 async function formatStats(env) {
   const state = await loadState(env);
   const L = ['📊 Реакции и обучение фильтра:'];
-  const fb = state.fbCounts || { up: 0, down: 0 };
-  L.push(`Голоса: 👍 ${fb.up} · 👎 ${fb.down}`);
+  const fbList = Object.values(state.feedback || {});
+  const high = fbList.filter((f) => f.v === 1).length;
+  const low = fbList.filter((f) => f.v === -1).length;
+  L.push(`Оценено вакансий: ${fbList.length} — высокая ${high}, низкая ${low}, нейтральная ${fbList.length - high - low}`);
   const entries = Object.entries(state.wordWeights || {});
   const neg = entries.filter(([, v]) => v < 0).sort((a, b) => a[1] - b[1]).slice(0, 10);
   const pos = entries.filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]).slice(0, 10);
