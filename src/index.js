@@ -178,9 +178,8 @@ async function handleVacancyLookup(env, chatId, ids) {
       const text = await fetchVacancyText(id, state, true);
       const title = (text.match(/📌\s*(.+)/) || [, ''])[1].trim();
       state.vacWords[id] = { w: extractWordsFromVacancy(title, text), s: 'ссылка', t: nowStamp };
-      for (const part of splitText('https://hh.ru/vacancy/' + id + '\n\n' + text)) {
-        await sendTelegramTo(env, chatId, [{ text: part, vacancyId: id }]);
-      }
+      const parts = splitText('https://hh.ru/vacancy/' + id + '\n\n' + text);
+      parts.forEach((part, i) => sendTelegramTo(env, chatId, [{ text: part, vacancyId: i === parts.length - 1 ? id : null }]));
     } catch (e) {
       await sendTelegramTo(env, chatId, ['Не удалось получить вакансию: ' + e.message]).catch(() => {});
     }

@@ -99,14 +99,16 @@ export function splitText(text, limit = 3800) {
   return parts;
 }
 
-// каждое сообщение — ссылка + описание вакансии; первым идёт заголовок; вакансии — с кнопками
+// каждое сообщение — ссылка + описание вакансии; первым идёт заголовок.
+// Если вакансия не влезла в одно сообщение, кнопки 👍/👎 — только на последнем куске
 export function formatMessages(fresh) {
   const header = `hh.ru: новых вакансий — ${fresh.length} (${fmtMSK.format(Date.now())})`;
   const sorted = fresh.sort((a, b) => a.search.localeCompare(b.search));
   const msgs = [{ text: header }];
   for (const v of sorted) {
     const text = v.details ? v.link + '\n\n' + v.details : v.link;
-    for (const part of splitText(text)) msgs.push({ text: part, vacancyId: v.id });
+    const parts = splitText(text);
+    parts.forEach((part, i) => msgs.push({ text: part, vacancyId: i === parts.length - 1 ? v.id : null }));
   }
   return msgs;
 }

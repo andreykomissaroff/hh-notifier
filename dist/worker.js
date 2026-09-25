@@ -633,7 +633,8 @@ function formatMessages(fresh) {
   const msgs = [{ text: header }];
   for (const v of sorted) {
     const text = v.details ? v.link + "\n\n" + v.details : v.link;
-    for (const part of splitText(text)) msgs.push({ text: part, vacancyId: v.id });
+    const parts = splitText(text);
+    parts.forEach((part, i) => msgs.push({ text: part, vacancyId: i === parts.length - 1 ? v.id : null }));
   }
   return msgs;
 }
@@ -1067,9 +1068,8 @@ async function handleVacancyLookup(env, chatId, ids) {
       const text = await fetchVacancyText(id, state, true);
       const title = (text.match(/📌\s*(.+)/) || [, ""])[1].trim();
       state.vacWords[id] = { w: extractWordsFromVacancy(title, text), s: "\u0441\u0441\u044B\u043B\u043A\u0430", t: nowStamp };
-      for (const part of splitText("https://hh.ru/vacancy/" + id + "\n\n" + text)) {
-        await sendTelegramTo(env, chatId, [{ text: part, vacancyId: id }]);
-      }
+      const parts = splitText("https://hh.ru/vacancy/" + id + "\n\n" + text);
+      parts.forEach((part, i) => sendTelegramTo(env, chatId, [{ text: part, vacancyId: i === parts.length - 1 ? id : null }]));
     } catch (e) {
       await sendTelegramTo(env, chatId, ["\u041D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u043F\u043E\u043B\u0443\u0447\u0438\u0442\u044C \u0432\u0430\u043A\u0430\u043D\u0441\u0438\u044E: " + e.message]).catch(() => {
       });
