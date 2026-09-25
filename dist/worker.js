@@ -553,15 +553,33 @@ function feedbackKeyboard(id, v) {
 async function sendTelegram(env, texts) {
   const list = typeof texts === "string" ? [texts] : texts;
   const chatId = Number(env.TELEGRAM_CHAT_ID);
+  const sentIds = [];
   for (let i = 0; i < list.length; i++) {
     if (i > 0) await sleep(400);
     const t = typeof list[i] === "string" ? { text: list[i] } : list[i];
     const body = { chat_id: chatId, text: t.text, disable_web_page_preview: true };
     if (t.vacancyId) body.reply_markup = feedbackKeyboard(t.vacancyId);
-    const data = await tgFetch(env, "sendMessage", body);
-    if (!data.ok) throw new Error("Telegram API: " + (data.description || "send error"));
+    let ok = false, lastError = "";
+    for (let attempt = 0; attempt < 3 && !ok; attempt++) {
+      if (attempt > 0) await sleep(3e3);
+      const data = await tgFetch(env, "sendMessage", body);
+      if (data.ok) {
+        ok = true;
+        break;
+      }
+      lastError = data.description || "HTTP " + data.error_code;
+      const retryable = data.error_code === 429 || data.error_code >= 500;
+      if (data.error_code === 429) await sleep((data.parameters?.retry_after || 3) * 1e3);
+      else if (!retryable) break;
+    }
+    if (ok) {
+      if (t.vacancyId) sentIds.push(t.vacancyId);
+    } else {
+      console.error("sendMessage failed: " + lastError + " | text: " + String(t.text).slice(0, 60));
+    }
   }
-  console.log(`Telegram: \u043E\u0442\u043F\u0440\u0430\u0432\u043B\u0435\u043D\u043E \u0441\u043E\u043E\u0431\u0449\u0435\u043D\u0438\u0439 \u2014 ${list.length}`);
+  console.log(`Telegram: \u043E\u0442\u043F\u0440\u0430\u0432\u043B\u0435\u043D\u043E \u0441\u043E\u043E\u0431\u0449\u0435\u043D\u0438\u0439 \u2014 ${sentIds.length} \u0438\u0437 ${list.length}`);
+  return { sentIds };
 }
 async function sendTelegramTo(env, chatId, texts) {
   const list = typeof texts === "string" ? [texts] : texts;
@@ -707,10 +725,24 @@ async function runNotifier(env) {
   console.log(log.join("\n"));
   if (fresh.length === 0) {
     console.log("\u041D\u043E\u0432\u044B\u0445 \u0432\u0430\u043A\u0430\u043D\u0441\u0438\u0439 \u043D\u0435\u0442 \u2014 \u0441\u043E\u043E\u0431\u0449\u0435\u043D\u0438\u0435 \u043D\u0435 \u043E\u0442\u043F\u0440\u0430\u0432\u043B\u044F\u0435\u0442\u0441\u044F");
-    return { fresh: 0, sent: 0 };
+    return { fresh: 0, sent: 0, failed: 0 };
   }
-  await sendTelegram(env, formatMessages(fresh));
-  return { fresh: fresh.length, sent: fresh.length };
+  const { sentIds } = await sendTelegram(env, formatMessages(fresh));
+  const sentSet = new Set(sentIds);
+  let failed = 0;
+  for (const v of fresh) {
+    if (!sentSet.has(v.id)) {
+      delete state.seen[v.id];
+      delete state.vacWords[v.id];
+      failed++;
+    }
+  }
+  if (failed > 0) {
+    log.push(`\u26A0\uFE0F \u041D\u0435 \u0434\u043E\u0441\u0442\u0430\u0432\u043B\u0435\u043D\u043E \u0432\u0430\u043A\u0430\u043D\u0441\u0438\u0439: ${failed} \u2014 \u0432\u0435\u0440\u043D\u0443\u0442\u0441\u044F \u0432 \u0441\u043B\u0435\u0434\u0443\u044E\u0449\u0435\u043C \u043F\u0440\u043E\u0433\u043E\u043D\u0435`);
+    console.error("\u041D\u0435\u0434\u043E\u0441\u0442\u0430\u0432\u043B\u0435\u043D\u043D\u044B\u0435 \u0432\u0430\u043A\u0430\u043D\u0441\u0438\u0438 \u0432\u0435\u0440\u043D\u0443\u0442\u0441\u044F: " + failed);
+  }
+  await saveState(env, state);
+  return { fresh: fresh.length, sent: sentIds.length, failed };
 }
 
 // src/learn.js
@@ -1014,7 +1046,9 @@ async function handleRunCommand(env, chatId) {
   try {
     await sendTelegramTo(env, chatId, ["\u23F3 \u0417\u0430\u043F\u0443\u0441\u043A\u0430\u044E \u043F\u0440\u043E\u0432\u0435\u0440\u043A\u0443 hh.ru..."]);
     const result = await runNotifier(env);
-    if (result.sent > 0) {
+    if (result.failed > 0) {
+      await sendTelegramTo(env, chatId, [`\u26A0\uFE0F \u0413\u043E\u0442\u043E\u0432\u043E: \u043D\u0430\u0439\u0434\u0435\u043D\u043E ${result.fresh}, \u0434\u043E\u0441\u0442\u0430\u0432\u043B\u0435\u043D\u043E ${result.sent}. \u041D\u0435\u0434\u043E\u0441\u0442\u0430\u0432\u043B\u0435\u043D\u043D\u044B\u0435 (${result.failed}) \u043F\u043E\u0432\u0442\u043E\u0440\u044F\u0442\u0441\u044F \u0432 \u0441\u043B\u0435\u0434\u0443\u044E\u0449\u0435\u043C \u043F\u0440\u043E\u0433\u043E\u043D\u0435.`]);
+    } else if (result.sent > 0) {
       await sendTelegramTo(env, chatId, [`\u2705 \u0413\u043E\u0442\u043E\u0432\u043E: \u043D\u0430\u0439\u0434\u0435\u043D\u043E \u043D\u043E\u0432\u044B\u0445 \u2014 ${result.fresh}, \u043E\u0442\u043F\u0440\u0430\u0432\u043B\u0435\u043D\u043E.`]);
     } else if (result.fresh === 0) {
       await sendTelegramTo(env, chatId, ["\u2705 \u0413\u043E\u0442\u043E\u0432\u043E: \u043D\u043E\u0432\u044B\u0445 \u0432\u0430\u043A\u0430\u043D\u0441\u0438\u0439 \u043D\u0435\u0442."]);

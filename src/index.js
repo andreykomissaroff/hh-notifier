@@ -153,7 +153,9 @@ async function handleRunCommand(env, chatId) {
   try {
     await sendTelegramTo(env, chatId, ['⏳ Запускаю проверку hh.ru...']);
     const result = await runNotifier(env);
-    if (result.sent > 0) {
+    if (result.failed > 0) {
+      await sendTelegramTo(env, chatId, [`⚠️ Готово: найдено ${result.fresh}, доставлено ${result.sent}. Недоставленные (${result.failed}) повторятся в следующем прогоне.`]);
+    } else if (result.sent > 0) {
       await sendTelegramTo(env, chatId, [`✅ Готово: найдено новых — ${result.fresh}, отправлено.`]);
     } else if (result.fresh === 0) {
       await sendTelegramTo(env, chatId, ['✅ Готово: новых вакансий нет.']);

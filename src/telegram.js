@@ -20,19 +20,36 @@ export function feedbackKeyboard(id, v) {
   ]] };
 }
 
-// texts: массив строк/объектов { text, vacancyId } или одна строка
+// texts: массив строк/объектов { text, vacancyId } или одна строка.
+// Не бросает исключение при отказе отдельных сообщений: ретраит 429/5xx
+// (уважая retry_after) и возвращает id вакансий, доставленных успешно.
 export async function sendTelegram(env, texts) {
   const list = typeof texts === 'string' ? [texts] : texts;
   const chatId = Number(env.TELEGRAM_CHAT_ID);
+  const sentIds = [];
   for (let i = 0; i < list.length; i++) {
     if (i > 0) await sleep(400); // лимит Telegram ~1 сообщение/сек на чат
     const t = typeof list[i] === 'string' ? { text: list[i] } : list[i];
     const body = { chat_id: chatId, text: t.text, disable_web_page_preview: true };
     if (t.vacancyId) body.reply_markup = feedbackKeyboard(t.vacancyId);
-    const data = await tgFetch(env, 'sendMessage', body);
-    if (!data.ok) throw new Error('Telegram API: ' + (data.description || 'send error'));
+    let ok = false, lastError = '';
+    for (let attempt = 0; attempt < 3 && !ok; attempt++) {
+      if (attempt > 0) await sleep(3000);
+      const data = await tgFetch(env, 'sendMessage', body);
+      if (data.ok) { ok = true; break; }
+      lastError = data.description || ('HTTP ' + data.error_code);
+      const retryable = data.error_code === 429 || data.error_code >= 500;
+      if (data.error_code === 429) await sleep(((data.parameters?.retry_after) || 3) * 1000);
+      else if (!retryable) break; // 4xx — повтор бессмыслен
+    }
+    if (ok) {
+      if (t.vacancyId) sentIds.push(t.vacancyId);
+    } else {
+      console.error('sendMessage failed: ' + lastError + ' | text: ' + String(t.text).slice(0, 60));
+    }
   }
-  console.log(`Telegram: отправлено сообщений — ${list.length}`);
+  console.log(`Telegram: отправлено сообщений — ${sentIds.length} из ${list.length}`);
+  return { sentIds };
 }
 
 // отправка в указанный чат (ответы на команды, онбординг, присланные ссылки)

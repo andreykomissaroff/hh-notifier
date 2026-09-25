@@ -99,8 +99,25 @@ export async function runNotifier(env) {
 
   if (fresh.length === 0) {
     console.log('Новых вакансий нет — сообщение не отправляется');
-    return { fresh: 0, sent: 0 };
+    return { fresh: 0, sent: 0, failed: 0 };
   }
-  await sendTelegram(env, formatMessages(fresh));
-  return { fresh: fresh.length, sent: fresh.length };
+  const { sentIds } = await sendTelegram(env, formatMessages(fresh));
+
+  // недоставленные вакансии возвращаются в очередь следующего прогона:
+  // снимаем пометку «обработано», чтобы не потерять их молча
+  const sentSet = new Set(sentIds);
+  let failed = 0;
+  for (const v of fresh) {
+    if (!sentSet.has(v.id)) {
+      delete state.seen[v.id];
+      delete state.vacWords[v.id];
+      failed++;
+    }
+  }
+  if (failed > 0) {
+    log.push(`⚠️ Не доставлено вакансий: ${failed} — вернутся в следующем прогоне`);
+    console.error('Недоставленные вакансии вернутся: ' + failed);
+  }
+  await saveState(env, state);
+  return { fresh: fresh.length, sent: sentIds.length, failed };
 }
