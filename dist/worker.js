@@ -54,7 +54,7 @@ var CONFIG = {
     "136898219"
   ],
   // реакционное обучение: авто-скрытие вакансий с сильно негативным рейтингом
-  negativeScoreToSkip: -2,
+  negativeScoreToSkip: -4,
   minWeightedWords: 3,
   // текстовый скоринг: минимум «знакомых» слов
   titleMinWeightedWords: 2,
