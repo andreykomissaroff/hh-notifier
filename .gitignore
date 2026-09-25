@@ -3,3 +3,4 @@ tail.log
 PLAN-migration-yandex-hybrid.md
 initial-state.json
 .wrangler/
+state-*.json
