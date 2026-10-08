@@ -11,7 +11,7 @@ export async function fetchVacancyText(id, state, allowApi) {
     if (r.ok) return formatApi(await r.json());
     if (r.status === 404) throw new Error('вакансия не найдена или удалена');
     if (state) {
-      state.apiDisabledUntil = new Date(Date.now() + 24 * 86400 * 1000).toISOString();
+      state.apiDisabledUntil = new Date(Date.now() + 24 * 3600 * 1000).toISOString();
       console.log('api.hh.ru отказал (' + r.status + ') — сутки используем только HTML-фолбэк');
     }
   }

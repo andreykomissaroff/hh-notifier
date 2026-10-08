@@ -35,7 +35,15 @@ export async function sendTelegram(env, texts) {
     let ok = false, lastError = '';
     for (let attempt = 0; attempt < 3 && !ok; attempt++) {
       if (attempt > 0) await sleep(3000);
-      const data = await tgFetch(env, 'sendMessage', body);
+      let data;
+      try {
+        data = await tgFetch(env, 'sendMessage', body);
+      } catch (e) {
+        // сеть/битый ответ: ретраим как 5xx — сбой одного сообщения не должен
+        // ронять исключением весь дайджест мимо возврата в очередь
+        lastError = 'сеть: ' + e.message;
+        continue;
+      }
       if (data.ok) { ok = true; break; }
       lastError = data.description || ('HTTP ' + data.error_code);
       const retryable = data.error_code === 429 || data.error_code >= 500;
@@ -99,16 +107,20 @@ export function splitText(text, limit = 3800) {
   return parts;
 }
 
-// каждое сообщение — ссылка + описание вакансии; первым идёт заголовок.
-// Если вакансия не влезла в одно сообщение, кнопки 👍/👎 — только на последнем куске
-export function formatMessages(fresh) {
-  const header = `hh.ru: новых вакансий — ${fresh.length} (${fmtMSK.format(Date.now())})`;
-  const sorted = fresh.sort((a, b) => a.search.localeCompare(b.search));
+// сообщения дайджеста из набора вакансий: первым идёт заголовок, у длинных вакансий
+// кнопки 👍/👎 — только на последнем куске. Используется и прогоном, и /retry
+// (items — вакансии формы {id, title, link, details, search})
+export function digestMessages(header, items) {
   const msgs = [{ text: header }];
+  const sorted = [...items].sort((a, b) => a.search.localeCompare(b.search));
   for (const v of sorted) {
     const text = v.details ? v.link + '\n\n' + v.details : v.link;
     const parts = splitText(text);
     parts.forEach((part, i) => msgs.push({ text: part, vacancyId: i === parts.length - 1 ? v.id : null }));
   }
   return msgs;
+}
+
+export function formatMessages(fresh) {
+  return digestMessages(`hh.ru: новых вакансий — ${fresh.length} (${fmtMSK.format(Date.now())})`, fresh);
 }

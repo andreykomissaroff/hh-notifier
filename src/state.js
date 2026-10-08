@@ -12,6 +12,7 @@ export async function loadState(env) {
   state.vacWords = state.vacWords || {};
   state.wordWeights = state.wordWeights || {};
   state.feedback = state.feedback || {};
+  state.runs = Array.isArray(state.runs) ? state.runs : [];
   return state;
 }
 

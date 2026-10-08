@@ -92,6 +92,19 @@ export async function runNotifier(env) {
     state.vacWords[v.id] = { w: extractWordsFromVacancy(v.title, v.details || ''), s: v.search, t: nowIso };
   }
   pruneFeedbackData(state);
+
+  // история прогонов для /runs и /retry: сохраняем ДО отправки, чтобы прогон остался
+  // в истории, даже если отправка умрёт посередине
+  let runRecord = null;
+  if (fresh.length > 0) {
+    runRecord = {
+      t: nowIso,
+      sent: null,
+      failed: null,
+      items: fresh.map((v) => ({ id: v.id, title: v.title, link: v.link, details: v.details || '', search: v.search })),
+    };
+    state.runs = [runRecord, ...(state.runs || [])].slice(0, CONFIG.runHistoryLimit);
+  }
   await saveState(env, state);
 
   log.push(`Скоринг: кандидатов ${candidates.length}, скрыто рейтингом ${hiddenByScore}, к отправке ${fresh.length}, сбоев описаний ${descFailures}`);
@@ -101,7 +114,15 @@ export async function runNotifier(env) {
     console.log('Новых вакансий нет — сообщение не отправляется');
     return { fresh: 0, sent: 0, failed: 0 };
   }
-  const { sentIds } = await sendTelegram(env, formatMessages(fresh));
+
+  let sentIds = [];
+  try {
+    ({ sentIds } = await sendTelegram(env, formatMessages(fresh)));
+  } catch (e) {
+    // sendTelegram не бросает при отказе отдельных сообщений; сюда попадает только
+    // крах самого цикла — тогда все вакансии считаем недоставленными
+    console.error('sendTelegram упал: ' + e.message);
+  }
 
   // недоставленные вакансии возвращаются в очередь следующего прогона:
   // снимаем пометку «обработано», чтобы не потерять их молча
@@ -114,9 +135,13 @@ export async function runNotifier(env) {
       failed++;
     }
   }
+  if (runRecord) { runRecord.sent = sentIds.length; runRecord.failed = failed; }
   if (failed > 0) {
-    log.push(`⚠️ Не доставлено вакансий: ${failed} — вернутся в следующем прогоне`);
     console.error('Недоставленные вакансии вернутся: ' + failed);
+    try {
+      // в cron-прогоне это единственное видимое в чате сообщение о сбое доставки
+      await sendTelegram(env, ['⚠️ hh-notifier: доставлено ' + sentIds.length + ' из ' + fresh.length + ' вакансий. Недоставленные (' + failed + ') повторятся в следующем прогоне; повторить сейчас — /retry.']);
+    } catch {}
   }
   await saveState(env, state);
   return { fresh: fresh.length, sent: sentIds.length, failed };

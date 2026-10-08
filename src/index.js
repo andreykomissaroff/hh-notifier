@@ -7,13 +7,19 @@ import { fetchVacancyText } from './enrich.js';
 import { extractWordsFromVacancy } from './scoring.js';
 import { handleFeedback, formatStats } from './learn.js';
 import { onboardingText, handleResume, confirmProfile, hasProfile } from './onboard.js';
-import { sendTelegramTo, splitText } from './telegram.js';
-import { sleep } from './util.js';
+import { sendTelegram, sendTelegramTo, digestMessages, splitText } from './telegram.js';
+import { sleep, fmtMSK } from './util.js';
 
 export default {
-  // запуск по расписанию (cron в wrangler.toml)
+  // запуск по расписанию (cron «*/5 3-18 * * *»): каждый час прогон выполняет ровно
+  // один 5-минутный слот, в случайную минуту ±10 от часа — см. cronJitterMs
   async scheduled(controller, env, ctx) {
-    ctx.waitUntil(runNotifier(env).catch((e) => console.error('FATAL: ' + e.message)));
+    ctx.waitUntil((async () => {
+      const waitMs = await cronJitterMs();
+      if (waitMs === null) return; // холостой слот — к hh.ru не обращаемся
+      if (waitMs > 0) await sleep(waitMs);
+      await runNotifier(env).catch((e) => console.error('FATAL: ' + e.message));
+    })());
   },
 
   async fetch(request, env, ctx) {
@@ -53,6 +59,21 @@ export default {
         body: JSON.stringify({ url: hookUrl, allowed_updates: ['message', 'callback_query'], drop_pending_updates: true }),
       });
       const data = await res.json();
+      // заодно обновляем меню команд в интерфейсе Telegram (не критично для работы)
+      ctx.waitUntil(fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setMyCommands`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          commands: [
+            { command: 'run', description: 'проверить hh.ru прямо сейчас' },
+            { command: 'runs', description: 'последние дайджесты' },
+            { command: 'retry', description: 'повторить дайджест: /retry или /retry N' },
+            { command: 'stats', description: 'статистика реакций и обучения' },
+            { command: 'test', description: 'проверить доставку сообщений' },
+            { command: 'help', description: 'справка' },
+          ],
+        }),
+      }).catch(() => {}));
       return new Response(JSON.stringify(data), { status: data.ok ? 200 : 500, headers: { 'Content-Type': 'application/json' } });
     }
 
@@ -97,6 +118,11 @@ export default {
         } else if (cmd === '/run') {
           // синхронно: waitUntil убивает прогон на ~30-й секунде; Telegram-вебхук ждёт до 60 с
           await handleRunCommand(env, msg.chat.id);
+        } else if (cmd === '/runs') {
+          ctx.waitUntil(sendTelegramTo(env, msg.chat.id, [await formatRuns(env)]).catch(() => {}));
+        } else if (cmd === '/retry') {
+          // синхронно, как /run: пачка сообщений обычно укладывается в ожидание вебхука
+          await handleRetryCommand(env, msg.chat.id, text);
         } else if (cmd === '/test') {
           ctx.waitUntil(sendTelegramTo(env, msg.chat.id, ['✅ Тест доставки: связь воркер → Telegram работает.']).catch(() => {}));
         } else if (cmd === '/stats') {
@@ -111,7 +137,7 @@ export default {
           if (ids.length) {
             await handleVacancyLookup(env, msg.chat.id, ids);
           } else {
-            ctx.waitUntil(sendTelegramTo(env, msg.chat.id, ['Не знаю такую команду. Доступно: /run, /test, /stats, /help. Можно прислать ссылку на вакансию hh.ru — пришлю описание.']).catch(() => {}));
+            ctx.waitUntil(sendTelegramTo(env, msg.chat.id, ['Не знаю такую команду. Доступно: /run, /runs, /retry, /test, /stats, /help. Можно прислать ссылку на вакансию hh.ru — пришлю описание.']).catch(() => {}));
           }
         }
       }
@@ -127,6 +153,8 @@ function helpText() {
   return [
     'Команды hh-notifier:',
     '/run — проверить hh.ru прямо сейчас (пришлю вакансии, если появились новые)',
+    '/runs — последние дайджесты (номер, время, сколько вакансий, доставлено)',
+    '/retry [номер] — прислать дайджест ещё раз: без номера — последний, с номером — из списка /runs',
     '/test — проверить доставку сообщений',
     '/stats — статистика ваших реакций и обучения фильтра',
     '/resume <текст или файл .txt> — извлечь профиль из резюме и сгенерировать поиск заново',
@@ -152,6 +180,28 @@ async function handleResumeFile(env, chatId, fileId) {
   }
 }
 
+// случайное смещение прогона внутри часа, чтобы опросы hh.ru не выглядели ботовыми:
+// target = час:00 + offset(-10..+10 минут), offset детерминирован хешем «дата час»,
+// поэтому все cron-запуски часа считают один и тот же target; прогон делает тот
+// 5-минутный слот, в который попал target (ждёт до 4 минут; лимит scheduled —
+// 15 минут wall time). Возвращает паузу в мс или null, если запуск холостой.
+async function cronJitterMs() {
+  const now = new Date();
+  let hourKey = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), now.getUTCHours());
+  if (now.getUTCMinutes() >= 50) hourKey += 3600e3; // слоты :50-:59 обслуживают следующий час
+  const hour = new Date(hourKey).getUTCHours();
+  if (hour < 4 || hour > 18) return null; // окно прогонов 07:00-21:00 МСК
+  const d = new Date(hourKey);
+  const seed = `${d.getUTCFullYear()}-${d.getUTCMonth() + 1}-${d.getUTCDate()} ${d.getUTCHours()}`;
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(seed)));
+  const target = hourKey + ((digest[0] % 21) - 10) * 60000;
+  const waitMs = target - now.getTime();
+  // окно уже 5-минутного интервала между запусками и с допуском -60 с на поздний
+  // старт cron, поэтому ровно один слот проходит проверку при любом target
+  if (waitMs < -60e3 || waitMs >= 4 * 60000) return null;
+  return Math.max(0, waitMs);
+}
+
 // фоновое выполнение /run из чата: подтверждение -> прогон -> отчёт
 async function handleRunCommand(env, chatId) {
   try {
@@ -169,6 +219,65 @@ async function handleRunCommand(env, chatId) {
   }
 }
 
+// /runs — список последних прогонов (номера для /retry)
+async function formatRuns(env) {
+  const state = await loadState(env);
+  const runs = state.runs || [];
+  if (!runs.length) return 'Истории прогонов ещё нет — она появится с первым дайджестом.';
+  const L = ['Последние прогоны:'];
+  runs.forEach((r, i) => {
+    const sent = r.sent == null ? 'доставка неизвестна' : 'доставлено ' + r.sent;
+    L.push(`${i + 1}. ${fmtMSK.format(Date.parse(r.t))} МСК — вакансий: ${r.items.length} (${sent})`);
+  });
+  L.push('', 'Повторить: /retry — последний, /retry <номер> — выбранный.');
+  return L.join('\n');
+}
+
+// /retry [номер] — повторная отправка дайджеста из истории; seen не трогаем,
+// дедуп не задействован, кнопки реакций работают как обычно
+async function handleRetryCommand(env, chatId, text) {
+  try {
+    const state = await loadState(env);
+    const runs = state.runs || [];
+    if (!runs.length) {
+      await sendTelegramTo(env, chatId, ['Истории прогонов ещё нет — /retry заработает с первым дайджестом.']).catch(() => {});
+      return;
+    }
+    const arg = (text.trim().split(/\s+/)[1] || '').trim();
+    let idx = 0;
+    if (arg) {
+      const n = parseInt(arg, 10);
+      if (!n || n < 1 || n > runs.length) {
+        await sendTelegramTo(env, chatId, ['Номер от 1 до ' + runs.length + '. Список: /runs.']).catch(() => {});
+        return;
+      }
+      idx = n - 1;
+    }
+    if (state.retryBusy && Date.parse(state.retryBusy) > Date.now()) {
+      await sendTelegramTo(env, chatId, ['Повтор уже выполняется — подождите минуту.']).catch(() => {});
+      return;
+    }
+    const run = runs[idx];
+    state.retryBusy = new Date(Date.now() + 5 * 60000).toISOString(); // самосбрасывается
+    await saveState(env, state);
+    await sendTelegramTo(env, chatId, ['⏳ Повторяю дайджест №' + (idx + 1) + ' от ' + fmtMSK.format(Date.parse(run.t)) + ' МСК — вакансий: ' + run.items.length + '...']);
+    const { sentIds } = await sendTelegram(env, digestMessages(
+      'hh.ru: повтор дайджеста от ' + fmtMSK.format(Date.parse(run.t)) + ' — вакансий: ' + run.items.length,
+      run.items
+    ));
+    if (sentIds.length < run.items.length) {
+      const again = idx ? ' /retry ' + (idx + 1) : ' /retry';
+      await sendTelegramTo(env, chatId, ['⚠️ Повтор: доставлено ' + sentIds.length + ' из ' + run.items.length + '. Попробуйте ещё раз:' + again]).catch(() => {});
+    } else {
+      await sendTelegramTo(env, chatId, ['✅ Повтор: отправлено ' + sentIds.length + '.']).catch(() => {});
+    }
+    state.retryBusy = undefined;
+    await saveState(env, state);
+  } catch (e) {
+    await sendTelegramTo(env, chatId, ['⚠️ Ошибка повтора: ' + e.message]).catch(() => {});
+  }
+}
+
 // присланные ссылки: ссылка -> очищенное описание; вакансия помечается отработанной
 // (state.seen), пополняет словарь слов и в дайджест больше не попадает
 async function handleVacancyLookup(env, chatId, ids) {
@@ -183,7 +292,10 @@ async function handleVacancyLookup(env, chatId, ids) {
       const title = (text.match(/📌\s*(.+)/) || [, ''])[1].trim();
       state.vacWords[id] = { w: extractWordsFromVacancy(title, text), s: 'ссылка', t: nowStamp };
       const parts = splitText('https://hh.ru/vacancy/' + id + '\n\n' + text);
-      parts.forEach((part, i) => sendTelegramTo(env, chatId, [{ text: part, vacancyId: i === parts.length - 1 ? id : null }]));
+      // последовательно и с ожиданием: незавершённые промисы обрываются после ответа вебхука
+      for (let i = 0; i < parts.length; i++) {
+        await sendTelegramTo(env, chatId, [{ text: parts[i], vacancyId: i === parts.length - 1 ? id : null }]);
+      }
     } catch (e) {
       await sendTelegramTo(env, chatId, ['Не удалось получить вакансию: ' + e.message]).catch(() => {});
     }
