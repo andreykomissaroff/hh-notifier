@@ -4,7 +4,7 @@
 import { CONFIG } from './config.js';
 import { loadState, saveState, getActiveProfile, pruneSeen, pruneFeedbackData } from './state.js';
 import { buildTasks, parseItems, matchesAny } from './feed.js';
-import { enrichCandidates } from './enrich.js';
+import { enrichCandidates, fetchVacancyText } from './enrich.js';
 import { scoreVacancy, extractWordsFromVacancy } from './scoring.js';
 import { sendTelegram, formatMessages } from './telegram.js';
 import { sleep } from './util.js';
@@ -112,6 +112,8 @@ export async function runNotifier(env) {
 
   if (fresh.length === 0) {
     console.log('Новых вакансий нет — сообщение не отправляется');
+    await lateEnrichFollowUp(env, state, allowApi, new Set(), repliedSet);
+    await saveState(env, state);
     return { fresh: 0, sent: 0, failed: 0 };
   }
 
@@ -143,6 +145,43 @@ export async function runNotifier(env) {
       await sendTelegram(env, ['⚠️ hh-notifier: доставлено ' + sentIds.length + ' из ' + fresh.length + ' вакансий. Недоставленные (' + failed + ') повторятся в следующем прогоне; повторить сейчас — /retry.']);
     } catch {}
   }
+  await lateEnrichFollowUp(env, state, allowApi, new Set(candidates.map((c) => String(c.id))), repliedSet);
   await saveState(env, state);
   return { fresh: fresh.length, sent: sentIds.length, failed };
+}
+
+// доливка описаний для вакансий недавних прогонов, где скачать не удалось в свой
+// прогон (например, вакансия скрыта от анонимного API, или hh.ru мигнул сбоем).
+// Потолок за прогон и лимит попыток на вакансию — чтобы не долбить hh.ru впустую;
+// успешные уходят в чат отдельным сообщением, details в истории обновляется (/retry
+// тоже начинает присылать полный текст)
+async function lateEnrichFollowUp(env, state, allowApi, skipIds, repliedSet) {
+  const late = [];
+  for (const r of state.runs) {
+    if (Date.now() - Date.parse(r.t) > CONFIG.lateEnrichHours * 3600e3) continue;
+    for (const it of r.items) {
+      if (it.details || (it.tries || 0) >= CONFIG.lateTries) continue;
+      if (skipIds.has(String(it.id)) || repliedSet.has(String(it.id))) continue;
+      late.push(it);
+    }
+  }
+  const got = [];
+  for (const it of late.slice(0, CONFIG.maxLateEnrichPerRun)) {
+    it.tries = (it.tries || 0) + 1;
+    try {
+      it.details = await fetchVacancyText(it.id, state, allowApi);
+      got.push(it);
+    } catch {}
+    await sleep(CONFIG.enrichPauseMs);
+  }
+  if (!got.length) return;
+  console.log('Доливка описаний: получено ' + got.length + ' из ' + late.length + ' ожидавших');
+  try {
+    await sendTelegram(env, [
+      '📦 Описания вакансий из прошлых прогонов (тогда скачать не удалось):',
+      ...got.map((it) => ({ text: it.link + '\n\n' + it.details, vacancyId: it.id })),
+    ]);
+  } catch (e) {
+    console.error('Не отправлены долитые описания: ' + e.message);
+  }
 }

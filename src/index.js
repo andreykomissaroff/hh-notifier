@@ -9,6 +9,7 @@ import { handleFeedback, formatStats } from './learn.js';
 import { onboardingText, handleResume, confirmProfile, hasProfile } from './onboard.js';
 import { sendTelegram, sendTelegramTo, digestMessages, splitText } from './telegram.js';
 import { sleep, fmtMSK } from './util.js';
+import { CONFIG } from './config.js';
 
 export default {
   // запуск по расписанию (cron «*/5 3-18 * * *»): каждый час прогон выполняет ровно
@@ -35,17 +36,26 @@ export default {
       return new Response('OK: тестовое сообщение отправлено в Telegram');
     }
 
-    // диагностика: /diag?key=СЕКРЕТ — webhook-info + состояние профиля
+    // диагностика: /diag?key=СЕКРЕТ — webhook-info + состояние профиля;
+    // /diag?key=СЕКРЕТ&vac=<id> — самотест: как hh.ru отвечает воркеру по этой вакансии
     if (url.pathname === '/diag' && env.TELEGRAM_WEBHOOK_SECRET && url.searchParams.get('key') === env.TELEGRAM_WEBHOOK_SECRET) {
-      const [hookRes, profile, state] = await Promise.all([
+      const vacId = url.searchParams.get('vac');
+      const [hookRes, profile, state, hhCheck] = await Promise.all([
         fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getWebhookInfo`).then((r) => r.json()),
         loadProfile(env),
         loadState(env),
+        vacId && /^\d+$/.test(vacId)
+          ? Promise.all([
+              fetch(`https://api.hh.ru/vacancies/${vacId}`, { headers: { 'User-Agent': CONFIG.userAgent } }).then((r) => r.status).catch((e) => 'сеть: ' + e.message),
+              fetch(`https://hh.ru/vacancy/${vacId}`, { headers: { 'User-Agent': CONFIG.userAgent, 'Accept-Language': 'ru' } }).then((r) => r.status).catch((e) => 'сеть: ' + e.message),
+            ]).then(([apiStatus, htmlStatus]) => ({ vacId, apiStatus, htmlStatus }))
+          : Promise.resolve(null),
       ]);
       const data = {
         webhook: hookRes.result,
         profile: profile ? { title: profile.title || '', roles: profile.roles?.length || 0, searches: profile.searches?.length || 0 } : null,
         state: { seen: Object.keys(state.seen).length, weights: Object.keys(state.wordWeights || {}).length, feedback: Object.keys(state.feedback || {}).length },
+        hhCheck,
       };
       return new Response(JSON.stringify(data, null, 2), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }

@@ -5,12 +5,13 @@ import { CONFIG } from './config.js';
 import { sleep } from './util.js';
 
 // state/allowApi: если api.hh.ru отказал, сутки ходим сразу по HTML — без двойных запросов.
+// 404 от API не считаем финальным: часть живых вакансий скрыта от анонимного API, а их
+// HTML-страница доступна — вакансия удалена, только если 404 отдаёт и HTML-страница.
 export async function fetchVacancyText(id, state, allowApi) {
   if (allowApi) {
     const r = await fetch(`https://api.hh.ru/vacancies/${id}`, { headers: { 'User-Agent': CONFIG.userAgent } });
     if (r.ok) return formatApi(await r.json());
-    if (r.status === 404) throw new Error('вакансия не найдена или удалена');
-    if (state) {
+    if (r.status !== 404 && state) {
       state.apiDisabledUntil = new Date(Date.now() + 24 * 3600 * 1000).toISOString();
       console.log('api.hh.ru отказал (' + r.status + ') — сутки используем только HTML-фолбэк');
     }

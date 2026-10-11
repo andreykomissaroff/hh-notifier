@@ -108,15 +108,23 @@ export function splitText(text, limit = 3800) {
 }
 
 // сообщения дайджеста из набора вакансий: первым идёт заголовок, у длинных вакансий
-// кнопки 👍/👎 — только на последнем куске. Используется и прогоном, и /retry
-// (items — вакансии формы {id, title, link, details, search})
+// кнопки 👍/👎 — только на последнем куске. Вакансии, описание которых скачать не
+// удалось, идут одним блоком в конце (название + ссылка вместо голой ссылки).
+// Используется и прогоном, и /retry (items — вакансии {id, title, link, details, search})
 export function digestMessages(header, items) {
   const msgs = [{ text: header }];
   const sorted = [...items].sort((a, b) => a.search.localeCompare(b.search));
+  const noDetails = [];
   for (const v of sorted) {
-    const text = v.details ? v.link + '\n\n' + v.details : v.link;
-    const parts = splitText(text);
+    if (!v.details) { noDetails.push(v); continue; }
+    const parts = splitText(v.link + '\n\n' + v.details);
     parts.forEach((part, i) => msgs.push({ text: part, vacancyId: i === parts.length - 1 ? v.id : null }));
+  }
+  if (noDetails.length) {
+    msgs.push({
+      text: '⚠️ Описание скачать не удалось (возможно, вакансии уже закрыты) — пришлю позже, если получится. Полный текст по ссылке:\n\n' +
+        noDetails.map((v) => '📌 ' + (v.title || 'без названия') + '\n' + v.link).join('\n\n'),
+    });
   }
   return msgs;
 }

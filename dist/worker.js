@@ -65,6 +65,12 @@ var CONFIG = {
   enrichPauseMs: 1200,
   runHistoryLimit: 24,
   // сколько последних прогонов хранить для /runs и /retry
+  lateEnrichHours: 48,
+  // сколько часов после прогона повторять попытки скачать описание
+  maxLateEnrichPerRun: 5,
+  // потолок «доливки» описаний за прогон
+  lateTries: 3,
+  // максимум попыток скачать описание одной вакансии
   // профиль по умолчанию (пример из резюме владельца репозитория).
   // При онбординге заменяется профилем из KV — см. src/profile.js.
   // Корни слов: совпадение = токен вакансии начинается с корня (ё нормализована в «е»).
@@ -273,8 +279,7 @@ async function fetchVacancyText(id, state, allowApi) {
   if (allowApi) {
     const r = await fetch(`https://api.hh.ru/vacancies/${id}`, { headers: { "User-Agent": CONFIG.userAgent } });
     if (r.ok) return formatApi(await r.json());
-    if (r.status === 404) throw new Error("\u0432\u0430\u043A\u0430\u043D\u0441\u0438\u044F \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D\u0430 \u0438\u043B\u0438 \u0443\u0434\u0430\u043B\u0435\u043D\u0430");
-    if (state) {
+    if (r.status !== 404 && state) {
       state.apiDisabledUntil = new Date(Date.now() + 24 * 3600 * 1e3).toISOString();
       console.log("api.hh.ru \u043E\u0442\u043A\u0430\u0437\u0430\u043B (" + r.status + ") \u2014 \u0441\u0443\u0442\u043A\u0438 \u0438\u0441\u043F\u043E\u043B\u044C\u0437\u0443\u0435\u043C \u0442\u043E\u043B\u044C\u043A\u043E HTML-\u0444\u043E\u043B\u0431\u044D\u043A");
     }
@@ -639,10 +644,19 @@ function splitText(text, limit = 3800) {
 function digestMessages(header, items) {
   const msgs = [{ text: header }];
   const sorted = [...items].sort((a, b) => a.search.localeCompare(b.search));
+  const noDetails = [];
   for (const v of sorted) {
-    const text = v.details ? v.link + "\n\n" + v.details : v.link;
-    const parts = splitText(text);
+    if (!v.details) {
+      noDetails.push(v);
+      continue;
+    }
+    const parts = splitText(v.link + "\n\n" + v.details);
     parts.forEach((part, i) => msgs.push({ text: part, vacancyId: i === parts.length - 1 ? v.id : null }));
+  }
+  if (noDetails.length) {
+    msgs.push({
+      text: "\u26A0\uFE0F \u041E\u043F\u0438\u0441\u0430\u043D\u0438\u0435 \u0441\u043A\u0430\u0447\u0430\u0442\u044C \u043D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C (\u0432\u043E\u0437\u043C\u043E\u0436\u043D\u043E, \u0432\u0430\u043A\u0430\u043D\u0441\u0438\u0438 \u0443\u0436\u0435 \u0437\u0430\u043A\u0440\u044B\u0442\u044B) \u2014 \u043F\u0440\u0438\u0448\u043B\u044E \u043F\u043E\u0437\u0436\u0435, \u0435\u0441\u043B\u0438 \u043F\u043E\u043B\u0443\u0447\u0438\u0442\u0441\u044F. \u041F\u043E\u043B\u043D\u044B\u0439 \u0442\u0435\u043A\u0441\u0442 \u043F\u043E \u0441\u0441\u044B\u043B\u043A\u0435:\n\n" + noDetails.map((v) => "\u{1F4CC} " + (v.title || "\u0431\u0435\u0437 \u043D\u0430\u0437\u0432\u0430\u043D\u0438\u044F") + "\n" + v.link).join("\n\n")
+    });
   }
   return msgs;
 }
@@ -747,6 +761,8 @@ async function runNotifier(env) {
   console.log(log.join("\n"));
   if (fresh.length === 0) {
     console.log("\u041D\u043E\u0432\u044B\u0445 \u0432\u0430\u043A\u0430\u043D\u0441\u0438\u0439 \u043D\u0435\u0442 \u2014 \u0441\u043E\u043E\u0431\u0449\u0435\u043D\u0438\u0435 \u043D\u0435 \u043E\u0442\u043F\u0440\u0430\u0432\u043B\u044F\u0435\u0442\u0441\u044F");
+    await lateEnrichFollowUp(env, state, allowApi, /* @__PURE__ */ new Set(), repliedSet);
+    await saveState(env, state);
     return { fresh: 0, sent: 0, failed: 0 };
   }
   let sentIds = [];
@@ -775,8 +791,40 @@ async function runNotifier(env) {
     } catch {
     }
   }
+  await lateEnrichFollowUp(env, state, allowApi, new Set(candidates.map((c) => String(c.id))), repliedSet);
   await saveState(env, state);
   return { fresh: fresh.length, sent: sentIds.length, failed };
+}
+async function lateEnrichFollowUp(env, state, allowApi, skipIds, repliedSet) {
+  const late = [];
+  for (const r of state.runs) {
+    if (Date.now() - Date.parse(r.t) > CONFIG.lateEnrichHours * 36e5) continue;
+    for (const it of r.items) {
+      if (it.details || (it.tries || 0) >= CONFIG.lateTries) continue;
+      if (skipIds.has(String(it.id)) || repliedSet.has(String(it.id))) continue;
+      late.push(it);
+    }
+  }
+  const got = [];
+  for (const it of late.slice(0, CONFIG.maxLateEnrichPerRun)) {
+    it.tries = (it.tries || 0) + 1;
+    try {
+      it.details = await fetchVacancyText(it.id, state, allowApi);
+      got.push(it);
+    } catch {
+    }
+    await sleep(CONFIG.enrichPauseMs);
+  }
+  if (!got.length) return;
+  console.log("\u0414\u043E\u043B\u0438\u0432\u043A\u0430 \u043E\u043F\u0438\u0441\u0430\u043D\u0438\u0439: \u043F\u043E\u043B\u0443\u0447\u0435\u043D\u043E " + got.length + " \u0438\u0437 " + late.length + " \u043E\u0436\u0438\u0434\u0430\u0432\u0448\u0438\u0445");
+  try {
+    await sendTelegram(env, [
+      "\u{1F4E6} \u041E\u043F\u0438\u0441\u0430\u043D\u0438\u044F \u0432\u0430\u043A\u0430\u043D\u0441\u0438\u0439 \u0438\u0437 \u043F\u0440\u043E\u0448\u043B\u044B\u0445 \u043F\u0440\u043E\u0433\u043E\u043D\u043E\u0432 (\u0442\u043E\u0433\u0434\u0430 \u0441\u043A\u0430\u0447\u0430\u0442\u044C \u043D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C):",
+      ...got.map((it) => ({ text: it.link + "\n\n" + it.details, vacancyId: it.id }))
+    ]);
+  } catch (e) {
+    console.error("\u041D\u0435 \u043E\u0442\u043F\u0440\u0430\u0432\u043B\u0435\u043D\u044B \u0434\u043E\u043B\u0438\u0442\u044B\u0435 \u043E\u043F\u0438\u0441\u0430\u043D\u0438\u044F: " + e.message);
+  }
 }
 
 // src/learn.js
@@ -972,15 +1020,21 @@ var index_default = {
       return new Response("OK: \u0442\u0435\u0441\u0442\u043E\u0432\u043E\u0435 \u0441\u043E\u043E\u0431\u0449\u0435\u043D\u0438\u0435 \u043E\u0442\u043F\u0440\u0430\u0432\u043B\u0435\u043D\u043E \u0432 Telegram");
     }
     if (url.pathname === "/diag" && env.TELEGRAM_WEBHOOK_SECRET && url.searchParams.get("key") === env.TELEGRAM_WEBHOOK_SECRET) {
-      const [hookRes, profile, state] = await Promise.all([
+      const vacId = url.searchParams.get("vac");
+      const [hookRes, profile, state, hhCheck] = await Promise.all([
         fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getWebhookInfo`).then((r) => r.json()),
         loadProfile(env),
-        loadState(env)
+        loadState(env),
+        vacId && /^\d+$/.test(vacId) ? Promise.all([
+          fetch(`https://api.hh.ru/vacancies/${vacId}`, { headers: { "User-Agent": CONFIG.userAgent } }).then((r) => r.status).catch((e) => "\u0441\u0435\u0442\u044C: " + e.message),
+          fetch(`https://hh.ru/vacancy/${vacId}`, { headers: { "User-Agent": CONFIG.userAgent, "Accept-Language": "ru" } }).then((r) => r.status).catch((e) => "\u0441\u0435\u0442\u044C: " + e.message)
+        ]).then(([apiStatus, htmlStatus]) => ({ vacId, apiStatus, htmlStatus })) : Promise.resolve(null)
       ]);
       const data = {
         webhook: hookRes.result,
         profile: profile ? { title: profile.title || "", roles: profile.roles?.length || 0, searches: profile.searches?.length || 0 } : null,
-        state: { seen: Object.keys(state.seen).length, weights: Object.keys(state.wordWeights || {}).length, feedback: Object.keys(state.feedback || {}).length }
+        state: { seen: Object.keys(state.seen).length, weights: Object.keys(state.wordWeights || {}).length, feedback: Object.keys(state.feedback || {}).length },
+        hhCheck
       };
       return new Response(JSON.stringify(data, null, 2), { status: 200, headers: { "Content-Type": "application/json" } });
     }
