@@ -286,7 +286,7 @@ async function fetchVacancyText(id, state, allowApi) {
   }
   const r2 = await fetch(`https://hh.ru/vacancy/${id}`, { headers: { "User-Agent": CONFIG.userAgent, "Accept-Language": "ru" } });
   if (r2.ok) return formatPage(await r2.text(), id);
-  if (r2.status === 404) throw new Error("\u0432\u0430\u043A\u0430\u043D\u0441\u0438\u044F \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D\u0430 \u0438\u043B\u0438 \u0443\u0434\u0430\u043B\u0435\u043D\u0430");
+  if (r2.status === 404) throw new Error("\u0432\u0430\u043A\u0430\u043D\u0441\u0438\u044F \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D\u0430 \u0438\u043B\u0438 \u0443\u0434\u0430\u043B\u0435\u043D\u0430 (hh.ru 404)");
   throw new Error("hh.ru \u0432\u0435\u0440\u043D\u0443\u043B " + r2.status);
 }
 function formatApi(v) {
@@ -367,6 +367,7 @@ async function enrichCandidates(candidates, state, allowApi, log) {
           console.log(`[${c.id}] \u043E\u043F\u0438\u0441\u0430\u043D\u0438\u0435 \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u043D\u043E: ${e.message}`);
         }
         c.details = "";
+        c.descError = e.message;
       }
       await sleep(CONFIG.enrichPauseMs);
     }
@@ -655,7 +656,7 @@ function digestMessages(header, items) {
   }
   if (noDetails.length) {
     msgs.push({
-      text: "\u26A0\uFE0F \u041E\u043F\u0438\u0441\u0430\u043D\u0438\u0435 \u0441\u043A\u0430\u0447\u0430\u0442\u044C \u043D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C (\u0432\u043E\u0437\u043C\u043E\u0436\u043D\u043E, \u0432\u0430\u043A\u0430\u043D\u0441\u0438\u0438 \u0443\u0436\u0435 \u0437\u0430\u043A\u0440\u044B\u0442\u044B) \u2014 \u043F\u0440\u0438\u0448\u043B\u044E \u043F\u043E\u0437\u0436\u0435, \u0435\u0441\u043B\u0438 \u043F\u043E\u043B\u0443\u0447\u0438\u0442\u0441\u044F. \u041F\u043E\u043B\u043D\u044B\u0439 \u0442\u0435\u043A\u0441\u0442 \u043F\u043E \u0441\u0441\u044B\u043B\u043A\u0435:\n\n" + noDetails.map((v) => "\u{1F4CC} " + (v.title || "\u0431\u0435\u0437 \u043D\u0430\u0437\u0432\u0430\u043D\u0438\u044F") + "\n" + v.link).join("\n\n")
+      text: "\u26A0\uFE0F \u041E\u043F\u0438\u0441\u0430\u043D\u0438\u0435 \u043F\u043E\u043B\u0443\u0447\u0438\u0442\u044C \u043D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u2014 \u0431\u043E\u0442 \u043F\u043E\u0432\u0442\u043E\u0440\u0438\u0442 \u043F\u043E\u043F\u044B\u0442\u043A\u0443 \u0432 \u0441\u043B\u0435\u0434\u0443\u044E\u0449\u0438\u0445 \u043F\u0440\u043E\u0433\u043E\u043D\u0430\u0445 (\u0434\u043E 3 \u043D\u0430 \u0432\u0430\u043A\u0430\u043D\u0441\u0438\u044E). \u041E\u0448\u0438\u0431\u043A\u0438 hh:\n\n" + noDetails.map((v) => "\u{1F4CC} " + (v.title || "\u0431\u0435\u0437 \u043D\u0430\u0437\u0432\u0430\u043D\u0438\u044F") + "\n" + v.link + (v.descError ? "\n\u043E\u0448\u0438\u0431\u043A\u0430: " + v.descError : "")).join("\n\n")
     });
   }
   return msgs;
@@ -723,8 +724,9 @@ async function runNotifier(env) {
   const descFailures = await enrichCandidates(candidates, state, allowApi, log);
   const descAlert = descFailures >= 2;
   if (descAlert && !state.descAlerted) {
+    const lines = candidates.filter((c) => c.descError && !/не найдена или удалена/.test(c.descError)).map((c) => "\u{1F4CC} " + c.title + "\n" + c.link + "\n\u043E\u0448\u0438\u0431\u043A\u0430: " + c.descError);
     try {
-      await sendTelegram(env, ["\u26A0\uFE0F hh-notifier: \u043D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u043F\u043E\u043B\u0443\u0447\u0438\u0442\u044C \u043E\u043F\u0438\u0441\u0430\u043D\u0438\u044F " + descFailures + " \u0432\u0430\u043A\u0430\u043D\u0441\u0438\u0439 \u2014 \u0432\u043E\u0437\u043C\u043E\u0436\u043D\u0430 \u043A\u0430\u043F\u0447\u0430/\u043E\u0433\u0440\u0430\u043D\u0438\u0447\u0435\u043D\u0438\u044F hh.ru. \u041F\u0440\u043E\u0432\u0435\u0440\u044C\u0442\u0435 /run \u0438\u043B\u0438 dashboard."]);
+      await sendTelegram(env, ["\u26A0\uFE0F hh-notifier: \u043D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u043F\u043E\u043B\u0443\u0447\u0438\u0442\u044C \u043E\u043F\u0438\u0441\u0430\u043D\u0438\u044F " + descFailures + " \u0432\u0430\u043A\u0430\u043D\u0441\u0438\u0439:\n\n" + lines.join("\n\n") + "\n\n\u0415\u0441\u043B\u0438 \u043E\u0448\u0438\u0431\u043A\u0430 \u043F\u043E\u0432\u0442\u043E\u0440\u044F\u0435\u0442\u0441\u044F \u2014 \u0432\u043E\u0437\u043C\u043E\u0436\u043D\u0430 \u043A\u0430\u043F\u0447\u0430/\u043E\u0433\u0440\u0430\u043D\u0438\u0447\u0435\u043D\u0438\u044F hh.ru. \u0411\u043E\u0442 \u043F\u043E\u0432\u0442\u043E\u0440\u0438\u0442 \u043F\u043E\u043F\u044B\u0442\u043A\u0438 \u0432 \u0441\u043B\u0435\u0434\u0443\u044E\u0449\u0438\u0445 \u043F\u0440\u043E\u0433\u043E\u043D\u0430\u0445; \u043F\u0440\u043E\u0432\u0435\u0440\u0438\u0442\u044C \u043E\u0442\u0432\u0435\u0442\u044B hh.ru: /diag?key=<\u0441\u0435\u043A\u0440\u0435\u0442>&vac=<id>."]);
     } catch {
     }
   }
@@ -752,7 +754,7 @@ async function runNotifier(env) {
       t: nowIso,
       sent: null,
       failed: null,
-      items: fresh.map((v) => ({ id: v.id, title: v.title, link: v.link, details: v.details || "", search: v.search }))
+      items: fresh.map((v) => ({ id: v.id, title: v.title, link: v.link, details: v.details || "", search: v.search, descError: v.descError || "" }))
     };
     state.runs = [runRecord, ...state.runs || []].slice(0, CONFIG.runHistoryLimit);
   }
@@ -810,8 +812,10 @@ async function lateEnrichFollowUp(env, state, allowApi, skipIds, repliedSet) {
     it.tries = (it.tries || 0) + 1;
     try {
       it.details = await fetchVacancyText(it.id, state, allowApi);
+      it.descError = "";
       got.push(it);
-    } catch {
+    } catch (e) {
+      it.descError = e.message;
     }
     await sleep(CONFIG.enrichPauseMs);
   }

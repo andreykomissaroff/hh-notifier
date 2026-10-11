@@ -18,7 +18,7 @@ export async function fetchVacancyText(id, state, allowApi) {
   }
   const r2 = await fetch(`https://hh.ru/vacancy/${id}`, { headers: { 'User-Agent': CONFIG.userAgent, 'Accept-Language': 'ru' } });
   if (r2.ok) return formatPage(await r2.text(), id);
-  if (r2.status === 404) throw new Error('вакансия не найдена или удалена');
+  if (r2.status === 404) throw new Error('вакансия не найдена или удалена (hh.ru 404)');
   throw new Error('hh.ru вернул ' + r2.status);
 }
 
@@ -111,6 +111,9 @@ export async function enrichCandidates(candidates, state, allowApi, log) {
           console.log(`[${c.id}] описание недоступно: ${e.message}`);
         }
         c.details = '';
+        // текст ошибки уходит в дайджест (блок «без описания») и в алерт —
+        // молчаливые отказы hh.ru должны быть видны пользователю
+        c.descError = e.message;
       }
       await sleep(CONFIG.enrichPauseMs);
     }

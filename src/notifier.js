@@ -63,11 +63,16 @@ export async function runNotifier(env) {
   const allowApi = Date.parse(state.apiDisabledUntil || 0) < Date.now();
   const descFailures = await enrichCandidates(candidates, state, allowApi, log);
 
-  // алерт при ошибках описаний: только на переходе «работало -> сломалось»
+  // алерт при ошибках описаний: только на переходе «работало -> сломалось»;
+  // помимо счётчика перечисляем вакансии с текстом ошибки hh.ru
   const descAlert = descFailures >= 2;
   if (descAlert && !state.descAlerted) {
+    const lines = candidates
+      .filter((c) => c.descError && !/не найдена или удалена/.test(c.descError))
+      .map((c) => '📌 ' + c.title + '\n' + c.link + '\nошибка: ' + c.descError);
     try {
-      await sendTelegram(env, ['⚠️ hh-notifier: не удалось получить описания ' + descFailures + ' вакансий — возможна капча/ограничения hh.ru. Проверьте /run или dashboard.']);
+      await sendTelegram(env, ['⚠️ hh-notifier: не удалось получить описания ' + descFailures + ' вакансий:\n\n' + lines.join('\n\n') +
+        '\n\nЕсли ошибка повторяется — возможна капча/ограничения hh.ru. Бот повторит попытки в следующих прогонах; проверить ответы hh.ru: /diag?key=<секрет>&vac=<id>.']);
     } catch {}
   }
   state.descAlerted = descAlert;
@@ -101,7 +106,7 @@ export async function runNotifier(env) {
       t: nowIso,
       sent: null,
       failed: null,
-      items: fresh.map((v) => ({ id: v.id, title: v.title, link: v.link, details: v.details || '', search: v.search })),
+      items: fresh.map((v) => ({ id: v.id, title: v.title, link: v.link, details: v.details || '', search: v.search, descError: v.descError || '' })),
     };
     state.runs = [runRecord, ...(state.runs || [])].slice(0, CONFIG.runHistoryLimit);
   }
@@ -170,8 +175,11 @@ async function lateEnrichFollowUp(env, state, allowApi, skipIds, repliedSet) {
     it.tries = (it.tries || 0) + 1;
     try {
       it.details = await fetchVacancyText(it.id, state, allowApi);
+      it.descError = '';
       got.push(it);
-    } catch {}
+    } catch (e) {
+      it.descError = e.message; // свежая ошибка попадёт в следующий дайджест/алерт
+    }
     await sleep(CONFIG.enrichPauseMs);
   }
   if (!got.length) return;

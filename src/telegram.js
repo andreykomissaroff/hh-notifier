@@ -122,8 +122,9 @@ export function digestMessages(header, items) {
   }
   if (noDetails.length) {
     msgs.push({
-      text: '⚠️ Описание скачать не удалось (возможно, вакансии уже закрыты) — пришлю позже, если получится. Полный текст по ссылке:\n\n' +
-        noDetails.map((v) => '📌 ' + (v.title || 'без названия') + '\n' + v.link).join('\n\n'),
+      text: '⚠️ Описание получить не удалось — бот повторит попытку в следующих прогонах (до 3 на вакансию). Ошибки hh:\n\n' +
+        noDetails.map((v) => '📌 ' + (v.title || 'без названия') + '\n' + v.link +
+          (v.descError ? '\nошибка: ' + v.descError : '')).join('\n\n'),
     });
   }
   return msgs;
