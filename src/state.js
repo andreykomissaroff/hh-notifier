@@ -13,6 +13,7 @@ export async function loadState(env) {
   state.wordWeights = state.wordWeights || {};
   state.feedback = state.feedback || {};
   state.runs = Array.isArray(state.runs) ? state.runs : [];
+  state.intervalHours = state.intervalHours || 1; // интервал регулярного поиска, часы (/interval)
   return state;
 }
 

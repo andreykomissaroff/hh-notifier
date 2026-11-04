@@ -12,11 +12,14 @@ import { sleep, fmtMSK } from './util.js';
 import { CONFIG } from './config.js';
 
 export default {
-  // запуск по расписанию (cron «*/5 3-18 * * *»): каждый час прогон выполняет ровно
-  // один 5-минутный слот, в случайную минуту ±10 от часа — см. cronJitterMs
+  // запуск по расписанию (cron «*/5 3-18 * * *»): прогон выполняет один 5-минутный
+  // слот в случайную минуту ±10 от часа — см. cronJitterMs; часы прогонов
+  // разрежаются интервалом /interval, а /stop полностью приостанавливает поиск
   async scheduled(controller, env, ctx) {
     ctx.waitUntil((async () => {
-      const waitMs = await cronJitterMs();
+      const state = await loadState(env);
+      if (state.searchPaused) return; // поиск остановлен командой /stop — hh.ru не опрашиваем
+      const waitMs = await cronJitterMs(state.intervalHours || 1);
       if (waitMs === null) return; // холостой слот — к hh.ru не обращаемся
       if (waitMs > 0) await sleep(waitMs);
       await runNotifier(env).catch((e) => console.error('FATAL: ' + e.message));
@@ -78,6 +81,9 @@ export default {
             { command: 'run', description: 'проверить hh.ru прямо сейчас' },
             { command: 'runs', description: 'последние дайджесты' },
             { command: 'retry', description: 'повторить дайджест: /retry или /retry N' },
+            { command: 'stop', description: 'остановить регулярный поиск (/resume-search — вернуть)' },
+            { command: 'resume-search', description: 'возобновить регулярный поиск после /stop' },
+            { command: 'interval', description: 'интервал регулярного поиска: /interval или /interval N (1-12 ч)' },
             { command: 'stats', description: 'статистика реакций и обучения' },
             { command: 'test', description: 'проверить доставку сообщений' },
             { command: 'help', description: 'справка' },
@@ -133,6 +139,13 @@ export default {
         } else if (cmd === '/retry') {
           // синхронно, как /run: пачка сообщений обычно укладывается в ожидание вебхука
           await handleRetryCommand(env, msg.chat.id, text);
+        } else if (cmd === '/stop') {
+          ctx.waitUntil(handleStopCommand(env, msg.chat.id).catch(() => {}));
+        } else if (cmd === '/resume-search') {
+          // имя /resume-search, чтобы не путать с /resume (профиль из резюме)
+          ctx.waitUntil(handleResumeSearch(env, msg.chat.id).catch(() => {}));
+        } else if (cmd === '/interval') {
+          ctx.waitUntil(handleIntervalCommand(env, msg.chat.id, text).catch(() => {}));
         } else if (cmd === '/test') {
           ctx.waitUntil(sendTelegramTo(env, msg.chat.id, ['✅ Тест доставки: связь воркер → Telegram работает.']).catch(() => {}));
         } else if (cmd === '/stats') {
@@ -147,7 +160,7 @@ export default {
           if (ids.length) {
             await handleVacancyLookup(env, msg.chat.id, ids);
           } else {
-            ctx.waitUntil(sendTelegramTo(env, msg.chat.id, ['Не знаю такую команду. Доступно: /run, /runs, /retry, /test, /stats, /help. Можно прислать ссылку на вакансию hh.ru — пришлю описание.']).catch(() => {}));
+            ctx.waitUntil(sendTelegramTo(env, msg.chat.id, ['Не знаю такую команду. Доступно: /run, /runs, /retry, /stop, /resume-search, /interval, /test, /stats, /help. Можно прислать ссылку на вакансию hh.ru — пришлю описание.']).catch(() => {}));
           }
         }
       }
@@ -165,6 +178,9 @@ function helpText() {
     '/run — проверить hh.ru прямо сейчас (пришлю вакансии, если появились новые)',
     '/runs — последние дайджесты (номер, время, сколько вакансий, доставлено)',
     '/retry [номер] — прислать дайджест ещё раз: без номера — последний, с номером — из списка /runs',
+    '/stop — остановить регулярный поиск по расписанию (ручной /run продолжает работать)',
+    '/resume-search — возобновить регулярный поиск после /stop',
+    '/interval [часы] — показать или установить интервал регулярного поиска (1–12 ч)',
     '/test — проверить доставку сообщений',
     '/stats — статистика ваших реакций и обучения фильтра',
     '/resume <текст или файл .txt> — извлечь профиль из резюме и сгенерировать поиск заново',
@@ -194,13 +210,16 @@ async function handleResumeFile(env, chatId, fileId) {
 // target = час:00 + offset(-10..+10 минут), offset детерминирован хешем «дата час»,
 // поэтому все cron-запуски часа считают один и тот же target; прогон делает тот
 // 5-минутный слот, в который попал target (ждёт до 4 минут; лимит scheduled —
-// 15 минут wall time). Возвращает паузу в мс или null, если запуск холостой.
-async function cronJitterMs() {
+// 15 минут wall time). intervalHours (задаётся /interval) разрежает часы:
+// прогон — каждый intervalHours-й час от начала окна (4 UTC). Возвращает паузу
+// в мс или null, если запуск холостой.
+async function cronJitterMs(intervalHours = 1) {
   const now = new Date();
   let hourKey = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), now.getUTCHours());
   if (now.getUTCMinutes() >= 50) hourKey += 3600e3; // слоты :50-:59 обслуживают следующий час
   const hour = new Date(hourKey).getUTCHours();
   if (hour < 4 || hour > 18) return null; // окно прогонов 07:00-21:00 МСК
+  if (((hour - 4) % (intervalHours || 1)) !== 0) return null; // разрежение по интервалу
   const d = new Date(hourKey);
   const seed = `${d.getUTCFullYear()}-${d.getUTCMonth() + 1}-${d.getUTCDate()} ${d.getUTCHours()}`;
   const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(seed)));
@@ -286,6 +305,74 @@ async function handleRetryCommand(env, chatId, text) {
   } catch (e) {
     await sendTelegramTo(env, chatId, ['⚠️ Ошибка повтора: ' + e.message]).catch(() => {});
   }
+}
+
+// /stop — остановка регулярного поиска: cron-прогоны не выполняются, hh.ru
+// не опрашивается. Ручной /run и всё остальное продолжают работать.
+async function handleStopCommand(env, chatId) {
+  const state = await loadState(env);
+  if (state.searchPaused) {
+    await sendTelegramTo(env, chatId, ['⏸ Регулярный поиск уже остановлен. Возобновить — /resume-search.']).catch(() => {});
+    return;
+  }
+  state.searchPaused = true;
+  state.pausedAt = new Date().toISOString();
+  await saveState(env, state);
+  await sendTelegramTo(env, chatId, [
+    '⏸ Регулярный поиск остановлен: по расписанию hh.ru больше не опрашивается, новые дайджесты не приходят.',
+    '',
+    'Ручной прогон — /run. Возобновить — /resume-search. Текущие настройки — /interval.',
+  ].join('\n')).catch(() => {});
+}
+
+// /resume-search — возобновление регулярного поиска после /stop
+async function handleResumeSearch(env, chatId) {
+  const state = await loadState(env);
+  if (!state.searchPaused) {
+    await sendTelegramTo(env, chatId, ['▶️ Регулярный поиск уже работает: интервал ' + (state.intervalHours || 1) + ' ч, часы прогонов ' + scheduleHours(state.intervalHours || 1) + ' МСК.']).catch(() => {});
+    return;
+  }
+  const pausedFor = state.pausedAt ? ', был остановлен ' + fmtMSK.format(Date.parse(state.pausedAt)) + ' МСК' : '';
+  state.searchPaused = false;
+  state.pausedAt = undefined;
+  await saveState(env, state);
+  await sendTelegramTo(env, chatId, ['▶️ Регулярный поиск возобновлён' + pausedFor + ': интервал ' + (state.intervalHours || 1) + ' ч, часы прогонов ' + scheduleHours(state.intervalHours || 1) + ' МСК (минута — случайная, ±10 от часа).']).catch(() => {});
+}
+
+// /interval [часы] — показать или установить интервал регулярного поиска (1–12 ч)
+async function handleIntervalCommand(env, chatId, text) {
+  const state = await loadState(env);
+  const cur = state.intervalHours || 1;
+  const arg = (text.trim().split(/\s+/)[1] || '').trim();
+  if (!arg) {
+    const status = state.searchPaused
+      ? '⏸ остановлен (/resume-search — возобновить)'
+      : '▶️ работает';
+    await sendTelegramTo(env, chatId, [
+      'Интервал регулярного поиска: ' + cur + ' ч. Статус: ' + status + '.',
+      'Часы прогонов: ' + scheduleHours(cur) + ' МСК (минута — случайная, ±10 от часа).',
+      '',
+      'Изменить: /interval <часы>, целое число от 1 до 12. Пример: /interval 3',
+    ].join('\n')).catch(() => {});
+    return;
+  }
+  const n = parseInt(arg, 10);
+  if (!n || n < 1 || n > 12 || String(n) !== arg) {
+    await sendTelegramTo(env, chatId, ['Интервал — целое число часов от 1 до 12. Пример: /interval 3']).catch(() => {});
+    return;
+  }
+  state.intervalHours = n;
+  await saveState(env, state);
+  const pausedNote = state.searchPaused ? '\nРегулярный поиск сейчас остановлен — возобновить: /resume-search.' : '';
+  await sendTelegramTo(env, chatId, ['✅ Интервал регулярного поиска: ' + n + ' ч. Часы прогонов: ' + scheduleHours(n) + ' МСК.' + pausedNote]).catch(() => {});
+}
+
+// часы регулярных прогонов при заданном интервале: окно 4..18 UTC с шагом H,
+// в МСК (UTC+3) это 07:00..21:00
+function scheduleHours(H) {
+  const out = [];
+  for (let h = 4; h <= 18; h += H) out.push((h + 3) + ':00');
+  return out.join(', ');
 }
 
 // присланные ссылки: ссылка -> очищенное описание; вакансия помечается отработанной

@@ -160,6 +160,7 @@ async function loadState(env) {
   state.wordWeights = state.wordWeights || {};
   state.feedback = state.feedback || {};
   state.runs = Array.isArray(state.runs) ? state.runs : [];
+  state.intervalHours = state.intervalHours || 1;
   return state;
 }
 async function saveState(env, state) {
@@ -1003,11 +1004,14 @@ function onboardingText() {
 
 // src/index.js
 var index_default = {
-  // запуск по расписанию (cron «*/5 3-18 * * *»): каждый час прогон выполняет ровно
-  // один 5-минутный слот, в случайную минуту ±10 от часа — см. cronJitterMs
+  // запуск по расписанию (cron «*/5 3-18 * * *»): прогон выполняет один 5-минутный
+  // слот в случайную минуту ±10 от часа — см. cronJitterMs; часы прогонов
+  // разрежаются интервалом /interval, а /stop полностью приостанавливает поиск
   async scheduled(controller, env, ctx) {
     ctx.waitUntil((async () => {
-      const waitMs = await cronJitterMs();
+      const state = await loadState(env);
+      if (state.searchPaused) return;
+      const waitMs = await cronJitterMs(state.intervalHours || 1);
       if (waitMs === null) return;
       if (waitMs > 0) await sleep(waitMs);
       await runNotifier(env).catch((e) => console.error("FATAL: " + e.message));
@@ -1058,6 +1062,9 @@ var index_default = {
             { command: "run", description: "\u043F\u0440\u043E\u0432\u0435\u0440\u0438\u0442\u044C hh.ru \u043F\u0440\u044F\u043C\u043E \u0441\u0435\u0439\u0447\u0430\u0441" },
             { command: "runs", description: "\u043F\u043E\u0441\u043B\u0435\u0434\u043D\u0438\u0435 \u0434\u0430\u0439\u0434\u0436\u0435\u0441\u0442\u044B" },
             { command: "retry", description: "\u043F\u043E\u0432\u0442\u043E\u0440\u0438\u0442\u044C \u0434\u0430\u0439\u0434\u0436\u0435\u0441\u0442: /retry \u0438\u043B\u0438 /retry N" },
+            { command: "stop", description: "\u043E\u0441\u0442\u0430\u043D\u043E\u0432\u0438\u0442\u044C \u0440\u0435\u0433\u0443\u043B\u044F\u0440\u043D\u044B\u0439 \u043F\u043E\u0438\u0441\u043A (/resume-search \u2014 \u0432\u0435\u0440\u043D\u0443\u0442\u044C)" },
+            { command: "resume-search", description: "\u0432\u043E\u0437\u043E\u0431\u043D\u043E\u0432\u0438\u0442\u044C \u0440\u0435\u0433\u0443\u043B\u044F\u0440\u043D\u044B\u0439 \u043F\u043E\u0438\u0441\u043A \u043F\u043E\u0441\u043B\u0435 /stop" },
+            { command: "interval", description: "\u0438\u043D\u0442\u0435\u0440\u0432\u0430\u043B \u0440\u0435\u0433\u0443\u043B\u044F\u0440\u043D\u043E\u0433\u043E \u043F\u043E\u0438\u0441\u043A\u0430: /interval \u0438\u043B\u0438 /interval N (1-12 \u0447)" },
             { command: "stats", description: "\u0441\u0442\u0430\u0442\u0438\u0441\u0442\u0438\u043A\u0430 \u0440\u0435\u0430\u043A\u0446\u0438\u0439 \u0438 \u043E\u0431\u0443\u0447\u0435\u043D\u0438\u044F" },
             { command: "test", description: "\u043F\u0440\u043E\u0432\u0435\u0440\u0438\u0442\u044C \u0434\u043E\u0441\u0442\u0430\u0432\u043A\u0443 \u0441\u043E\u043E\u0431\u0449\u0435\u043D\u0438\u0439" },
             { command: "help", description: "\u0441\u043F\u0440\u0430\u0432\u043A\u0430" }
@@ -1113,6 +1120,15 @@ var index_default = {
           }));
         } else if (cmd === "/retry") {
           await handleRetryCommand(env, msg.chat.id, text);
+        } else if (cmd === "/stop") {
+          ctx.waitUntil(handleStopCommand(env, msg.chat.id).catch(() => {
+          }));
+        } else if (cmd === "/resume-search") {
+          ctx.waitUntil(handleResumeSearch(env, msg.chat.id).catch(() => {
+          }));
+        } else if (cmd === "/interval") {
+          ctx.waitUntil(handleIntervalCommand(env, msg.chat.id, text).catch(() => {
+          }));
         } else if (cmd === "/test") {
           ctx.waitUntil(sendTelegramTo(env, msg.chat.id, ["\u2705 \u0422\u0435\u0441\u0442 \u0434\u043E\u0441\u0442\u0430\u0432\u043A\u0438: \u0441\u0432\u044F\u0437\u044C \u0432\u043E\u0440\u043A\u0435\u0440 \u2192 Telegram \u0440\u0430\u0431\u043E\u0442\u0430\u0435\u0442."]).catch(() => {
           }));
@@ -1128,7 +1144,7 @@ var index_default = {
           if (ids.length) {
             await handleVacancyLookup(env, msg.chat.id, ids);
           } else {
-            ctx.waitUntil(sendTelegramTo(env, msg.chat.id, ["\u041D\u0435 \u0437\u043D\u0430\u044E \u0442\u0430\u043A\u0443\u044E \u043A\u043E\u043C\u0430\u043D\u0434\u0443. \u0414\u043E\u0441\u0442\u0443\u043F\u043D\u043E: /run, /runs, /retry, /test, /stats, /help. \u041C\u043E\u0436\u043D\u043E \u043F\u0440\u0438\u0441\u043B\u0430\u0442\u044C \u0441\u0441\u044B\u043B\u043A\u0443 \u043D\u0430 \u0432\u0430\u043A\u0430\u043D\u0441\u0438\u044E hh.ru \u2014 \u043F\u0440\u0438\u0448\u043B\u044E \u043E\u043F\u0438\u0441\u0430\u043D\u0438\u0435."]).catch(() => {
+            ctx.waitUntil(sendTelegramTo(env, msg.chat.id, ["\u041D\u0435 \u0437\u043D\u0430\u044E \u0442\u0430\u043A\u0443\u044E \u043A\u043E\u043C\u0430\u043D\u0434\u0443. \u0414\u043E\u0441\u0442\u0443\u043F\u043D\u043E: /run, /runs, /retry, /stop, /resume-search, /interval, /test, /stats, /help. \u041C\u043E\u0436\u043D\u043E \u043F\u0440\u0438\u0441\u043B\u0430\u0442\u044C \u0441\u0441\u044B\u043B\u043A\u0443 \u043D\u0430 \u0432\u0430\u043A\u0430\u043D\u0441\u0438\u044E hh.ru \u2014 \u043F\u0440\u0438\u0448\u043B\u044E \u043E\u043F\u0438\u0441\u0430\u043D\u0438\u0435."]).catch(() => {
             }));
           }
         }
@@ -1144,6 +1160,9 @@ function helpText() {
     "/run \u2014 \u043F\u0440\u043E\u0432\u0435\u0440\u0438\u0442\u044C hh.ru \u043F\u0440\u044F\u043C\u043E \u0441\u0435\u0439\u0447\u0430\u0441 (\u043F\u0440\u0438\u0448\u043B\u044E \u0432\u0430\u043A\u0430\u043D\u0441\u0438\u0438, \u0435\u0441\u043B\u0438 \u043F\u043E\u044F\u0432\u0438\u043B\u0438\u0441\u044C \u043D\u043E\u0432\u044B\u0435)",
     "/runs \u2014 \u043F\u043E\u0441\u043B\u0435\u0434\u043D\u0438\u0435 \u0434\u0430\u0439\u0434\u0436\u0435\u0441\u0442\u044B (\u043D\u043E\u043C\u0435\u0440, \u0432\u0440\u0435\u043C\u044F, \u0441\u043A\u043E\u043B\u044C\u043A\u043E \u0432\u0430\u043A\u0430\u043D\u0441\u0438\u0439, \u0434\u043E\u0441\u0442\u0430\u0432\u043B\u0435\u043D\u043E)",
     "/retry [\u043D\u043E\u043C\u0435\u0440] \u2014 \u043F\u0440\u0438\u0441\u043B\u0430\u0442\u044C \u0434\u0430\u0439\u0434\u0436\u0435\u0441\u0442 \u0435\u0449\u0451 \u0440\u0430\u0437: \u0431\u0435\u0437 \u043D\u043E\u043C\u0435\u0440\u0430 \u2014 \u043F\u043E\u0441\u043B\u0435\u0434\u043D\u0438\u0439, \u0441 \u043D\u043E\u043C\u0435\u0440\u043E\u043C \u2014 \u0438\u0437 \u0441\u043F\u0438\u0441\u043A\u0430 /runs",
+    "/stop \u2014 \u043E\u0441\u0442\u0430\u043D\u043E\u0432\u0438\u0442\u044C \u0440\u0435\u0433\u0443\u043B\u044F\u0440\u043D\u044B\u0439 \u043F\u043E\u0438\u0441\u043A \u043F\u043E \u0440\u0430\u0441\u043F\u0438\u0441\u0430\u043D\u0438\u044E (\u0440\u0443\u0447\u043D\u043E\u0439 /run \u043F\u0440\u043E\u0434\u043E\u043B\u0436\u0430\u0435\u0442 \u0440\u0430\u0431\u043E\u0442\u0430\u0442\u044C)",
+    "/resume-search \u2014 \u0432\u043E\u0437\u043E\u0431\u043D\u043E\u0432\u0438\u0442\u044C \u0440\u0435\u0433\u0443\u043B\u044F\u0440\u043D\u044B\u0439 \u043F\u043E\u0438\u0441\u043A \u043F\u043E\u0441\u043B\u0435 /stop",
+    "/interval [\u0447\u0430\u0441\u044B] \u2014 \u043F\u043E\u043A\u0430\u0437\u0430\u0442\u044C \u0438\u043B\u0438 \u0443\u0441\u0442\u0430\u043D\u043E\u0432\u0438\u0442\u044C \u0438\u043D\u0442\u0435\u0440\u0432\u0430\u043B \u0440\u0435\u0433\u0443\u043B\u044F\u0440\u043D\u043E\u0433\u043E \u043F\u043E\u0438\u0441\u043A\u0430 (1\u201312 \u0447)",
     "/test \u2014 \u043F\u0440\u043E\u0432\u0435\u0440\u0438\u0442\u044C \u0434\u043E\u0441\u0442\u0430\u0432\u043A\u0443 \u0441\u043E\u043E\u0431\u0449\u0435\u043D\u0438\u0439",
     "/stats \u2014 \u0441\u0442\u0430\u0442\u0438\u0441\u0442\u0438\u043A\u0430 \u0432\u0430\u0448\u0438\u0445 \u0440\u0435\u0430\u043A\u0446\u0438\u0439 \u0438 \u043E\u0431\u0443\u0447\u0435\u043D\u0438\u044F \u0444\u0438\u043B\u044C\u0442\u0440\u0430",
     "/resume <\u0442\u0435\u043A\u0441\u0442 \u0438\u043B\u0438 \u0444\u0430\u0439\u043B .txt> \u2014 \u0438\u0437\u0432\u043B\u0435\u0447\u044C \u043F\u0440\u043E\u0444\u0438\u043B\u044C \u0438\u0437 \u0440\u0435\u0437\u044E\u043C\u0435 \u0438 \u0441\u0433\u0435\u043D\u0435\u0440\u0438\u0440\u043E\u0432\u0430\u0442\u044C \u043F\u043E\u0438\u0441\u043A \u0437\u0430\u043D\u043E\u0432\u043E",
@@ -1167,12 +1186,13 @@ async function handleResumeFile(env, chatId, fileId) {
     });
   }
 }
-async function cronJitterMs() {
+async function cronJitterMs(intervalHours = 1) {
   const now = /* @__PURE__ */ new Date();
   let hourKey = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), now.getUTCHours());
   if (now.getUTCMinutes() >= 50) hourKey += 36e5;
   const hour = new Date(hourKey).getUTCHours();
   if (hour < 4 || hour > 18) return null;
+  if ((hour - 4) % (intervalHours || 1) !== 0) return null;
   const d = new Date(hourKey);
   const seed = `${d.getUTCFullYear()}-${d.getUTCMonth() + 1}-${d.getUTCDate()} ${d.getUTCHours()}`;
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(seed)));
@@ -1256,6 +1276,69 @@ async function handleRetryCommand(env, chatId, text) {
     await sendTelegramTo(env, chatId, ["\u26A0\uFE0F \u041E\u0448\u0438\u0431\u043A\u0430 \u043F\u043E\u0432\u0442\u043E\u0440\u0430: " + e.message]).catch(() => {
     });
   }
+}
+async function handleStopCommand(env, chatId) {
+  const state = await loadState(env);
+  if (state.searchPaused) {
+    await sendTelegramTo(env, chatId, ["\u23F8 \u0420\u0435\u0433\u0443\u043B\u044F\u0440\u043D\u044B\u0439 \u043F\u043E\u0438\u0441\u043A \u0443\u0436\u0435 \u043E\u0441\u0442\u0430\u043D\u043E\u0432\u043B\u0435\u043D. \u0412\u043E\u0437\u043E\u0431\u043D\u043E\u0432\u0438\u0442\u044C \u2014 /resume-search."]).catch(() => {
+    });
+    return;
+  }
+  state.searchPaused = true;
+  state.pausedAt = (/* @__PURE__ */ new Date()).toISOString();
+  await saveState(env, state);
+  await sendTelegramTo(env, chatId, [
+    "\u23F8 \u0420\u0435\u0433\u0443\u043B\u044F\u0440\u043D\u044B\u0439 \u043F\u043E\u0438\u0441\u043A \u043E\u0441\u0442\u0430\u043D\u043E\u0432\u043B\u0435\u043D: \u043F\u043E \u0440\u0430\u0441\u043F\u0438\u0441\u0430\u043D\u0438\u044E hh.ru \u0431\u043E\u043B\u044C\u0448\u0435 \u043D\u0435 \u043E\u043F\u0440\u0430\u0448\u0438\u0432\u0430\u0435\u0442\u0441\u044F, \u043D\u043E\u0432\u044B\u0435 \u0434\u0430\u0439\u0434\u0436\u0435\u0441\u0442\u044B \u043D\u0435 \u043F\u0440\u0438\u0445\u043E\u0434\u044F\u0442.",
+    "",
+    "\u0420\u0443\u0447\u043D\u043E\u0439 \u043F\u0440\u043E\u0433\u043E\u043D \u2014 /run. \u0412\u043E\u0437\u043E\u0431\u043D\u043E\u0432\u0438\u0442\u044C \u2014 /resume-search. \u0422\u0435\u043A\u0443\u0449\u0438\u0435 \u043D\u0430\u0441\u0442\u0440\u043E\u0439\u043A\u0438 \u2014 /interval."
+  ].join("\n")).catch(() => {
+  });
+}
+async function handleResumeSearch(env, chatId) {
+  const state = await loadState(env);
+  if (!state.searchPaused) {
+    await sendTelegramTo(env, chatId, ["\u25B6\uFE0F \u0420\u0435\u0433\u0443\u043B\u044F\u0440\u043D\u044B\u0439 \u043F\u043E\u0438\u0441\u043A \u0443\u0436\u0435 \u0440\u0430\u0431\u043E\u0442\u0430\u0435\u0442: \u0438\u043D\u0442\u0435\u0440\u0432\u0430\u043B " + (state.intervalHours || 1) + " \u0447, \u0447\u0430\u0441\u044B \u043F\u0440\u043E\u0433\u043E\u043D\u043E\u0432 " + scheduleHours(state.intervalHours || 1) + " \u041C\u0421\u041A."]).catch(() => {
+    });
+    return;
+  }
+  const pausedFor = state.pausedAt ? ", \u0431\u044B\u043B \u043E\u0441\u0442\u0430\u043D\u043E\u0432\u043B\u0435\u043D " + fmtMSK.format(Date.parse(state.pausedAt)) + " \u041C\u0421\u041A" : "";
+  state.searchPaused = false;
+  state.pausedAt = void 0;
+  await saveState(env, state);
+  await sendTelegramTo(env, chatId, ["\u25B6\uFE0F \u0420\u0435\u0433\u0443\u043B\u044F\u0440\u043D\u044B\u0439 \u043F\u043E\u0438\u0441\u043A \u0432\u043E\u0437\u043E\u0431\u043D\u043E\u0432\u043B\u0451\u043D" + pausedFor + ": \u0438\u043D\u0442\u0435\u0440\u0432\u0430\u043B " + (state.intervalHours || 1) + " \u0447, \u0447\u0430\u0441\u044B \u043F\u0440\u043E\u0433\u043E\u043D\u043E\u0432 " + scheduleHours(state.intervalHours || 1) + " \u041C\u0421\u041A (\u043C\u0438\u043D\u0443\u0442\u0430 \u2014 \u0441\u043B\u0443\u0447\u0430\u0439\u043D\u0430\u044F, \xB110 \u043E\u0442 \u0447\u0430\u0441\u0430)."]).catch(() => {
+  });
+}
+async function handleIntervalCommand(env, chatId, text) {
+  const state = await loadState(env);
+  const cur = state.intervalHours || 1;
+  const arg = (text.trim().split(/\s+/)[1] || "").trim();
+  if (!arg) {
+    const status = state.searchPaused ? "\u23F8 \u043E\u0441\u0442\u0430\u043D\u043E\u0432\u043B\u0435\u043D (/resume-search \u2014 \u0432\u043E\u0437\u043E\u0431\u043D\u043E\u0432\u0438\u0442\u044C)" : "\u25B6\uFE0F \u0440\u0430\u0431\u043E\u0442\u0430\u0435\u0442";
+    await sendTelegramTo(env, chatId, [
+      "\u0418\u043D\u0442\u0435\u0440\u0432\u0430\u043B \u0440\u0435\u0433\u0443\u043B\u044F\u0440\u043D\u043E\u0433\u043E \u043F\u043E\u0438\u0441\u043A\u0430: " + cur + " \u0447. \u0421\u0442\u0430\u0442\u0443\u0441: " + status + ".",
+      "\u0427\u0430\u0441\u044B \u043F\u0440\u043E\u0433\u043E\u043D\u043E\u0432: " + scheduleHours(cur) + " \u041C\u0421\u041A (\u043C\u0438\u043D\u0443\u0442\u0430 \u2014 \u0441\u043B\u0443\u0447\u0430\u0439\u043D\u0430\u044F, \xB110 \u043E\u0442 \u0447\u0430\u0441\u0430).",
+      "",
+      "\u0418\u0437\u043C\u0435\u043D\u0438\u0442\u044C: /interval <\u0447\u0430\u0441\u044B>, \u0446\u0435\u043B\u043E\u0435 \u0447\u0438\u0441\u043B\u043E \u043E\u0442 1 \u0434\u043E 12. \u041F\u0440\u0438\u043C\u0435\u0440: /interval 3"
+    ].join("\n")).catch(() => {
+    });
+    return;
+  }
+  const n = parseInt(arg, 10);
+  if (!n || n < 1 || n > 12 || String(n) !== arg) {
+    await sendTelegramTo(env, chatId, ["\u0418\u043D\u0442\u0435\u0440\u0432\u0430\u043B \u2014 \u0446\u0435\u043B\u043E\u0435 \u0447\u0438\u0441\u043B\u043E \u0447\u0430\u0441\u043E\u0432 \u043E\u0442 1 \u0434\u043E 12. \u041F\u0440\u0438\u043C\u0435\u0440: /interval 3"]).catch(() => {
+    });
+    return;
+  }
+  state.intervalHours = n;
+  await saveState(env, state);
+  const pausedNote = state.searchPaused ? "\n\u0420\u0435\u0433\u0443\u043B\u044F\u0440\u043D\u044B\u0439 \u043F\u043E\u0438\u0441\u043A \u0441\u0435\u0439\u0447\u0430\u0441 \u043E\u0441\u0442\u0430\u043D\u043E\u0432\u043B\u0435\u043D \u2014 \u0432\u043E\u0437\u043E\u0431\u043D\u043E\u0432\u0438\u0442\u044C: /resume-search." : "";
+  await sendTelegramTo(env, chatId, ["\u2705 \u0418\u043D\u0442\u0435\u0440\u0432\u0430\u043B \u0440\u0435\u0433\u0443\u043B\u044F\u0440\u043D\u043E\u0433\u043E \u043F\u043E\u0438\u0441\u043A\u0430: " + n + " \u0447. \u0427\u0430\u0441\u044B \u043F\u0440\u043E\u0433\u043E\u043D\u043E\u0432: " + scheduleHours(n) + " \u041C\u0421\u041A." + pausedNote]).catch(() => {
+  });
+}
+function scheduleHours(H) {
+  const out = [];
+  for (let h = 4; h <= 18; h += H) out.push(h + 3 + ":00");
+  return out.join(", ");
 }
 async function handleVacancyLookup(env, chatId, ids) {
   const state = await loadState(env);
